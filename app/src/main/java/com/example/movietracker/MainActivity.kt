@@ -293,7 +293,6 @@ fun MovieTrackerApp(
         stats = st
     }
 
-    // Tự động kiểm tra mùa mới 1 lần/ngày khi mở app có TMDB Key
     LaunchedEffect(allMovies.isNotEmpty(), tmdbKey, autoCheckNewSeasons) {
         if (!hasRunDailySeasonCheck && allMovies.isNotEmpty() && autoCheckNewSeasons && tmdbKey.isNotBlank()) {
             hasRunDailySeasonCheck = true
@@ -2192,21 +2191,21 @@ fun SettingsAndBackupDialog(
                     // 1. Trakt.tv 1-Way Sync
                     Text("1. Trakt.tv Sync (1-Way Pull)", fontWeight = FontWeight.Bold)
                     Text(
-                        "Create a personal app at trakt.tv/oauth/applications/new (Redirect URI: urn:ietf:wg:oauth:2.0:oob) to get Client ID & Secret.",
+                        "Create a personal app at trakt.tv/oauth/applications/new (Redirect URI: urn:ietf:wg:oauth:2.0:oob). New PKCE apps only need Client ID.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     OutlinedTextField(
                         value = traktClientId,
                         onValueChange = { traktClientId = it },
-                        label = { Text("Trakt Client ID") },
+                        label = { Text("Trakt Client ID *") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = traktClientSecret,
                         onValueChange = { traktClientSecret = it },
-                        label = { Text("Trakt Client Secret") },
+                        label = { Text("Trakt Client Secret (optional - leave blank)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -2239,8 +2238,8 @@ fun SettingsAndBackupDialog(
                         Button(
                             enabled = !traktBusy,
                             onClick = {
-                                if (traktClientId.isBlank() || traktClientSecret.isBlank()) {
-                                    traktStatusText = "Enter Trakt Client ID & Secret first."
+                                if (traktClientId.isBlank()) {
+                                    traktStatusText = "Enter Trakt Client ID first."
                                     return@Button
                                 }
                                 prefs.edit()
