@@ -52,6 +52,8 @@ data class MovieItem(
     val plot: String = "",
     val posterUrl: String = "",
     val notes: String = "",
+    val episodeProgress: String = "",
+    val seriesEnded: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = System.currentTimeMillis()
 ) {
@@ -67,6 +69,200 @@ data class MovieItem(
         if (imdbUrl.isNotBlank()) return imdbUrl
         if (imdbId.isNotBlank()) return "https://www.imdb.com/title/$imdbId/"
         return ""
+    }
+
+    fun seriesGroupKey(): String {
+        return if (imdbId.isNotBlank()) {
+            "imdb:${imdbId.trim().lowercase(Locale.ROOT)}"
+        } else {
+            "title:${title.trim().lowercase(Locale.ROOT)}"
+        }
+    }
+}
+
+sealed interface LibraryEntry {
+    val sortUpdatedAt: Long
+    val sortWatchedDate: String
+    val sortImdbRating: Double?
+    val sortPersonalRating: Double?
+    val sortYear: Int
+    val sortTitle: String
+}
+
+data class SingleLibraryEntry(val item: MovieItem) : LibraryEntry {
+    override val sortUpdatedAt: Long get() = item.updatedAt
+    override val sortWatchedDate: String get() = item.watchedDate
+    override val sortImdbRating: Double? get() = item.imdbRating
+    override val sortPersonalRating: Double? get() = item.personalRating
+    override val sortYear: Int get() = item.releaseYear
+    override val sortTitle: String get() = item.title
+}
+
+data class SeriesGroupEntry(
+    val groupKey: String,
+    val title: String,
+    val releaseYear: Int,
+    val imdbId: String,
+    val imdbUrl: String,
+    val imdbRating: Double?,
+    val avgPersonalRating: Double?,
+    val genres: String,
+    val plot: String,
+    val posterUrl: String,
+    val seasons: List<MovieItem>,
+    val watchedCount: Int,
+    val watchlistCount: Int,
+    val droppedCount: Int,
+    val activeWatchingNote: String,
+    val seriesEnded: Boolean,
+    override val sortUpdatedAt: Long,
+    override val sortWatchedDate: String
+) : LibraryEntry {
+    override val sortImdbRating: Double? get() = imdbRating
+    override val sortPersonalRating: Double? get() = avgPersonalRating
+    override val sortYear: Int get() = releaseYear
+    override val sortTitle: String get() = title
+}
+
+data class SeriesCheckCandidate(
+    val groupKey: String,
+    val title: String,
+    val imdbId: String,
+    val imdbUrl: String,
+    val releaseYear: Int,
+    val maxSeasonNumber: Int,
+    val imdbRating: Double?,
+    val genres: String,
+    val plot: String,
+    val posterUrl: String,
+    val seasonIds: List<Long>
+)
+
+fun buildLibraryEntries(
+    allItems: List<MovieItem>,
+    search: String,
+    statusFilter: MovieStatus?,
+    typeFilter: String?,
+    sortOption: SortOption
+): List<LibraryEntry> {
+    val entries = mutableListOf<LibraryEntry>()
+    val seriesBuckets = linkedMapOf<String, MutableList<MovieItem>>()
+
+    for (item in allItems) {
+        if (item.type.equals("Series", ignoreCase = true)) {
+            seriesBuckets.getOrPut(item.seriesGroupKey()) { mutableListOf() }.add(item)
+        } else {
+            entries.add(SingleLibraryEntry(item))
+        }
+    }
+
+    for ((key, rawList) in seriesBuckets) {
+        val seasons = rawList.sortedWith(
+            compareBy<MovieItem> { it.seasonNumber ?: Int.MAX_VALUE }.thenBy { it.id }
+        )
+        val first = seasons.first()
+        val watchedCount = seasons.count { it.status == MovieStatus.WATCHED }
+        val watchlistCount = seasons.count { it.status == MovieStatus.WATCHLIST }
+        val droppedCount = seasons.count { it.status == MovieStatus.DROPPED }
+
+        val activeProgress = seasons.firstOrNull {
+            it.episodeProgress.startsWith("Watching:", ignoreCase = true) && it.status != MovieStatus.WATCHED
+        }?.let {
+            val sLabel = it.seasonNumber?.let { n -> "S${n.toString().padStart(2, '0')} " } ?: ""
+            "$sLabel${it.episodeProgress}"
+        } ?: ""
+
+        val personalScores = seasons.mapNotNull { it.personalRating }
+        val avgPersonal = if (personalScores.isNotEmpty()) personalScores.average() else null
+        val minYear = seasons.mapNotNull { it.releaseYear.takeIf { y -> y > 0 } }.minOrNull() ?: 0
+
+        entries.add(
+            SeriesGroupEntry(
+                groupKey = key,
+                title = first.title,
+                releaseYear = minYear,
+                imdbId = seasons.firstNotNullOfOrNull { it.imdbId.ifBlank { null } } ?: "",
+                imdbUrl = seasons.firstNotNullOfOrNull { it.imdbUrl.ifBlank { null } } ?: "",
+                imdbRating = seasons.firstNotNullOfOrNull { it.imdbRating },
+                avgPersonalRating = avgPersonal,
+                genres = seasons.firstNotNullOfOrNull { it.genres.ifBlank { null } } ?: "",
+                plot = seasons.firstNotNullOfOrNull { it.plot.ifBlank { null } } ?: "",
+                posterUrl = seasons.firstNotNullOfOrNull { it.posterUrl.ifBlank { null } } ?: "",
+                seasons = seasons,
+                watchedCount = watchedCount,
+                watchlistCount = watchlistCount,
+                droppedCount = droppedCount,
+                activeWatchingNote = activeProgress,
+                seriesEnded = seasons.any { it.seriesEnded },
+                sortUpdatedAt = seasons.maxOf { it.updatedAt },
+                sortWatchedDate = seasons.mapNotNull { it.watchedDate.ifBlank { null } }.maxOrNull() ?: ""
+            )
+        )
+    }
+
+    val q = search.trim().lowercase(Locale.ROOT)
+    val filtered = entries.filter { entry ->
+        val matchesType = when (typeFilter) {
+            null -> true
+            "Series" -> entry is SeriesGroupEntry
+            else -> entry is SingleLibraryEntry && entry.item.type.equals(typeFilter, ignoreCase = true)
+        }
+        if (!matchesType) return@filter false
+
+        val matchesStatus = when (statusFilter) {
+            null -> true
+            else -> when (entry) {
+                is SingleLibraryEntry -> entry.item.status == statusFilter
+                is SeriesGroupEntry -> entry.seasons.any { it.status == statusFilter }
+            }
+        }
+        if (!matchesStatus) return@filter false
+
+        if (q.isEmpty()) return@filter true
+        when (entry) {
+            is SingleLibraryEntry -> {
+                val m = entry.item
+                m.title.lowercase(Locale.ROOT).contains(q) ||
+                    m.imdbId.lowercase(Locale.ROOT).contains(q) ||
+                    m.genres.lowercase(Locale.ROOT).contains(q) ||
+                    m.notes.lowercase(Locale.ROOT).contains(q) ||
+                    m.releaseYear.toString().contains(q)
+            }
+            is SeriesGroupEntry -> {
+                entry.title.lowercase(Locale.ROOT).contains(q) ||
+                    entry.imdbId.lowercase(Locale.ROOT).contains(q) ||
+                    entry.genres.lowercase(Locale.ROOT).contains(q) ||
+                    entry.releaseYear.toString().contains(q) ||
+                    entry.seasons.any { s ->
+                        s.notes.lowercase(Locale.ROOT).contains(q) ||
+                            s.episodeProgress.lowercase(Locale.ROOT).contains(q)
+                    }
+            }
+        }
+    }
+
+    return when (sortOption) {
+        SortOption.UPDATED_DESC -> filtered.sortedByDescending { it.sortUpdatedAt }
+        SortOption.WATCHED_DATE_DESC -> filtered.sortedWith(
+            compareBy<LibraryEntry> { it.sortWatchedDate.isBlank() }
+                .thenByDescending { it.sortWatchedDate }
+                .thenByDescending { it.sortUpdatedAt }
+        )
+        SortOption.IMDB_RATING_DESC -> filtered.sortedWith(
+            compareBy<LibraryEntry> { it.sortImdbRating == null }
+                .thenByDescending { it.sortImdbRating ?: 0.0 }
+                .thenBy { it.sortTitle.lowercase(Locale.ROOT) }
+        )
+        SortOption.PERSONAL_RATING_DESC -> filtered.sortedWith(
+            compareBy<LibraryEntry> { it.sortPersonalRating == null }
+                .thenByDescending { it.sortPersonalRating ?: 0.0 }
+                .thenBy { it.sortTitle.lowercase(Locale.ROOT) }
+        )
+        SortOption.YEAR_DESC -> filtered.sortedWith(
+            compareByDescending<LibraryEntry> { it.sortYear }
+                .thenBy { it.sortTitle.lowercase(Locale.ROOT) }
+        )
+        SortOption.TITLE_ASC -> filtered.sortedBy { it.sortTitle.lowercase(Locale.ROOT) }
     }
 }
 
@@ -88,7 +284,7 @@ class MovieDatabaseHelper(context: Context) :
 
     companion object {
         private const val DATABASE_NAME = "movie_tracker.db"
-        private const val DATABASE_VERSION = 1
+        private const val DATABASE_VERSION = 2
         private const val TABLE_MOVIES = "movies"
     }
 
@@ -112,6 +308,8 @@ class MovieDatabaseHelper(context: Context) :
                 plot TEXT NOT NULL DEFAULT '',
                 poster_url TEXT NOT NULL DEFAULT '',
                 notes TEXT NOT NULL DEFAULT '',
+                episode_progress TEXT NOT NULL DEFAULT '',
+                series_ended INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
@@ -122,7 +320,12 @@ class MovieDatabaseHelper(context: Context) :
         db.execSQL("CREATE INDEX idx_movies_status ON $TABLE_MOVIES(status)")
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            runCatching { db.execSQL("ALTER TABLE $TABLE_MOVIES ADD COLUMN episode_progress TEXT NOT NULL DEFAULT ''") }
+            runCatching { db.execSQL("ALTER TABLE $TABLE_MOVIES ADD COLUMN series_ended INTEGER NOT NULL DEFAULT 0") }
+        }
+    }
 
     private fun MovieItem.toContentValues(): ContentValues {
         return ContentValues().apply {
@@ -145,6 +348,8 @@ class MovieDatabaseHelper(context: Context) :
             put("plot", plot.trim())
             put("poster_url", posterUrl.trim())
             put("notes", notes.trim())
+            put("episode_progress", episodeProgress.trim())
+            put("series_ended", if (seriesEnded) 1 else 0)
             put("created_at", createdAt)
             put("updated_at", updatedAt)
         }
@@ -154,6 +359,8 @@ class MovieDatabaseHelper(context: Context) :
         val seasonIdx = getColumnIndexOrThrow("season_number")
         val imdbRatIdx = getColumnIndexOrThrow("imdb_rating")
         val persRatIdx = getColumnIndexOrThrow("personal_rating")
+        val epProgIdx = getColumnIndex("episode_progress")
+        val endedIdx = getColumnIndex("series_ended")
         return MovieItem(
             id = getLong(getColumnIndexOrThrow("id")),
             title = getString(getColumnIndexOrThrow("title")),
@@ -171,6 +378,8 @@ class MovieDatabaseHelper(context: Context) :
             plot = getString(getColumnIndexOrThrow("plot")),
             posterUrl = getString(getColumnIndexOrThrow("poster_url")),
             notes = getString(getColumnIndexOrThrow("notes")),
+            episodeProgress = if (epProgIdx >= 0 && !isNull(epProgIdx)) getString(epProgIdx) else "",
+            seriesEnded = endedIdx >= 0 && !isNull(endedIdx) && getInt(endedIdx) == 1,
             createdAt = getLong(getColumnIndexOrThrow("created_at")),
             updatedAt = getLong(getColumnIndexOrThrow("updated_at"))
         )
@@ -208,49 +417,6 @@ class MovieDatabaseHelper(context: Context) :
         readableDatabase.rawQuery(
             "SELECT * FROM $TABLE_MOVIES ORDER BY updated_at DESC, id DESC",
             null
-        ).use { c ->
-            while (c.moveToNext()) list.add(c.toMovieItem())
-        }
-        return list
-    }
-
-    fun queryMovies(
-        search: String,
-        statusFilter: MovieStatus?,
-        typeFilter: String?,
-        sortOption: SortOption
-    ): List<MovieItem> {
-        val whereClauses = mutableListOf<String>()
-        val args = mutableListOf<String>()
-
-        if (search.isNotBlank()) {
-            val q = "%${search.trim()}%"
-            whereClauses.add("(title LIKE ? OR imdb_id LIKE ? OR genres LIKE ? OR notes LIKE ? OR CAST(release_year AS TEXT) LIKE ?)")
-            repeat(5) { args.add(q) }
-        }
-        if (statusFilter != null) {
-            whereClauses.add("status = ?")
-            args.add(statusFilter.code)
-        }
-        if (!typeFilter.isNullOrBlank()) {
-            whereClauses.add("LOWER(type) = LOWER(?)")
-            args.add(typeFilter)
-        }
-
-        val whereSql = if (whereClauses.isEmpty()) "" else "WHERE ${whereClauses.joinToString(" AND ")}"
-        val orderSql = when (sortOption) {
-            SortOption.UPDATED_DESC -> "ORDER BY updated_at DESC, id DESC"
-            SortOption.WATCHED_DATE_DESC -> "ORDER BY CASE WHEN watched_date = '' THEN 1 ELSE 0 END, watched_date DESC, id DESC"
-            SortOption.IMDB_RATING_DESC -> "ORDER BY CASE WHEN imdb_rating IS NULL THEN 1 ELSE 0 END, imdb_rating DESC, title ASC"
-            SortOption.PERSONAL_RATING_DESC -> "ORDER BY CASE WHEN personal_rating IS NULL THEN 1 ELSE 0 END, personal_rating DESC, title ASC"
-            SortOption.YEAR_DESC -> "ORDER BY release_year DESC, title ASC"
-            SortOption.TITLE_ASC -> "ORDER BY title COLLATE NOCASE ASC, COALESCE(season_number, 0) ASC"
-        }
-
-        val list = mutableListOf<MovieItem>()
-        readableDatabase.rawQuery(
-            "SELECT * FROM $TABLE_MOVIES $whereSql $orderSql",
-            args.toTypedArray()
         ).use { c ->
             while (c.moveToNext()) list.add(c.toMovieItem())
         }
@@ -297,6 +463,85 @@ class MovieDatabaseHelper(context: Context) :
         return list
     }
 
+    /** Lấy các Series đủ điều kiện kiểm tra mùa mới (chưa Ended, và mùa mới nhất chưa bị Dropped) */
+    fun getSeriesCandidatesForNewSeasons(): List<SeriesCheckCandidate> {
+        val groups = buildLibraryEntries(getAllMovies(), "", null, "Series", SortOption.UPDATED_DESC)
+            .filterIsInstance<SeriesGroupEntry>()
+        val candidates = mutableListOf<SeriesCheckCandidate>()
+        for (g in groups) {
+            if (g.seriesEnded) continue
+            val latestSeason = g.seasons.maxByOrNull { it.seasonNumber ?: 0 } ?: continue
+            // Bỏ qua nếu toàn bộ hoặc mùa mới nhất đã bị Dropped
+            if (latestSeason.status == MovieStatus.DROPPED || g.droppedCount == g.seasons.size) continue
+            val maxSeason = g.seasons.mapNotNull { it.seasonNumber }.maxOrNull() ?: 1
+            candidates.add(
+                SeriesCheckCandidate(
+                    groupKey = g.groupKey,
+                    title = g.title,
+                    imdbId = g.imdbId,
+                    imdbUrl = g.imdbUrl,
+                    releaseYear = g.releaseYear,
+                    maxSeasonNumber = maxSeason,
+                    imdbRating = g.imdbRating,
+                    genres = g.genres,
+                    plot = g.plot,
+                    posterUrl = g.posterUrl,
+                    seasonIds = g.seasons.map { it.id }
+                )
+            )
+        }
+        return candidates
+    }
+
+    fun markSeriesEnded(seasonIds: List<Long>) {
+        if (seasonIds.isEmpty()) return
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val cv = ContentValues().apply { put("series_ended", 1) }
+            for (id in seasonIds) {
+                db.update(TABLE_MOVIES, cv, "id = ?", arrayOf(id.toString()))
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    fun insertNewSeasonsSafely(items: List<MovieItem>): Int {
+        if (items.isEmpty()) return 0
+        var inserted = 0
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val existingKeys = getAllMovies().mapNotNull { m ->
+                val s = m.seasonNumber ?: 0
+                if (m.imdbId.isNotBlank()) "${m.imdbId.lowercase(Locale.ROOT)}#$s"
+                else "${m.title.trim().lowercase(Locale.ROOT)}#$s"
+            }.toMutableSet()
+
+            for (item in items) {
+                val s = item.seasonNumber ?: 0
+                val key = if (item.imdbId.isNotBlank()) {
+                    "${item.imdbId.lowercase(Locale.ROOT)}#$s"
+                } else {
+                    "${item.title.trim().lowercase(Locale.ROOT)}#$s"
+                }
+                if (key in existingKeys) continue
+                val now = System.currentTimeMillis()
+                val rowId = db.insert(TABLE_MOVIES, null, item.copy(createdAt = now, updatedAt = now).toContentValues())
+                if (rowId != -1L) {
+                    existingKeys.add(key)
+                    inserted++
+                }
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return inserted
+    }
+
     fun bulkImport(items: List<MovieItem>, mergeDuplicates: Boolean): ImportSummary {
         var added = 0
         var merged = 0
@@ -328,6 +573,8 @@ class MovieDatabaseHelper(context: Context) :
                         genres = existing.genres.ifBlank { item.genres },
                         plot = existing.plot.ifBlank { item.plot },
                         posterUrl = existing.posterUrl.ifBlank { item.posterUrl },
+                        episodeProgress = item.episodeProgress.ifBlank { existing.episodeProgress },
+                        seriesEnded = existing.seriesEnded || item.seriesEnded,
                         notes = mergedNotes,
                         updatedAt = System.currentTimeMillis()
                     )
@@ -348,6 +595,221 @@ class MovieDatabaseHelper(context: Context) :
             db.endTransaction()
         }
         return ImportSummary(added = added, mergedOrSkipped = merged, totalParsed = items.size)
+    }
+
+    fun applyTraktOneWaySync(
+        watchedMovies: List<TraktWatchedMovie>,
+        watchedSeasons: List<TraktSeasonSyncItem>,
+        watchlistItems: List<TraktWatchlistItem>,
+        ratings: List<TraktRatingItem>
+    ): TraktSyncSummary {
+        var moviesAdded = 0
+        var moviesUpdated = 0
+        var seasonsAdded = 0
+        var seasonsUpdated = 0
+        var watchlistAdded = 0
+        var ratingsUpdated = 0
+
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val all = getAllMovies().toMutableList()
+            val byImdbAndSeason = mutableMapOf<String, MovieItem>()
+            val byTitleAndSeason = mutableMapOf<String, MovieItem>()
+
+            fun indexItem(m: MovieItem) {
+                val s = m.seasonNumber ?: 0
+                if (m.imdbId.isNotBlank()) {
+                    byImdbAndSeason["${m.imdbId.lowercase(Locale.ROOT)}#$s"] = m
+                }
+                byTitleAndSeason["${m.title.trim().lowercase(Locale.ROOT)}#$s"] = m
+            }
+            all.forEach(::indexItem)
+
+            fun findMatch(imdbId: String, title: String, season: Int): MovieItem? {
+                if (imdbId.isNotBlank()) {
+                    byImdbAndSeason["${imdbId.lowercase(Locale.ROOT)}#$season"]?.let { return it }
+                }
+                return byTitleAndSeason["${title.trim().lowercase(Locale.ROOT)}#$season"]
+            }
+
+            // 1. Watched Movies
+            for (wm in watchedMovies) {
+                val existing = findMatch(wm.imdbId, wm.title, 0)
+                val dateIso = wm.lastWatchedAt.take(10)
+                if (existing != null) {
+                    val newCount = maxOf(existing.rewatchCount, wm.plays, 1)
+                    val newDate = if (dateIso.isNotBlank() && (existing.watchedDate.isBlank() || dateIso > existing.watchedDate)) {
+                        dateIso
+                    } else existing.watchedDate
+                    if (existing.status != MovieStatus.WATCHED || newCount != existing.rewatchCount || newDate != existing.watchedDate) {
+                        val updated = existing.copy(
+                            imdbId = existing.imdbId.ifBlank { wm.imdbId },
+                            imdbUrl = existing.imdbUrl.ifBlank { if (wm.imdbId.isNotBlank()) "https://www.imdb.com/title/${wm.imdbId}/" else "" },
+                            status = MovieStatus.WATCHED,
+                            watchedDate = newDate,
+                            rewatchCount = newCount,
+                            updatedAt = System.currentTimeMillis()
+                        )
+                        db.update(TABLE_MOVIES, updated.toContentValues(), "id = ?", arrayOf(existing.id.toString()))
+                        indexItem(updated)
+                        moviesUpdated++
+                    }
+                } else {
+                    val now = System.currentTimeMillis()
+                    val item = MovieItem(
+                        title = wm.title,
+                        type = "Movie",
+                        releaseYear = wm.year,
+                        imdbId = wm.imdbId,
+                        imdbUrl = if (wm.imdbId.isNotBlank()) "https://www.imdb.com/title/${wm.imdbId}/" else "",
+                        status = MovieStatus.WATCHED,
+                        watchedDate = dateIso,
+                        rewatchCount = maxOf(wm.plays, 1),
+                        createdAt = now,
+                        updatedAt = now
+                    )
+                    val id = db.insert(TABLE_MOVIES, null, item.toContentValues())
+                    if (id != -1L) {
+                        indexItem(item.copy(id = id))
+                        moviesAdded++
+                    }
+                }
+            }
+
+            // 2. Watched / In-progress Seasons
+            for (ws in watchedSeasons) {
+                val existing = findMatch(ws.imdbId, ws.showTitle, ws.seasonNumber)
+                val dateIso = ws.lastWatchedAt.take(10)
+                val isCompleted = ws.airedCount > 0 && ws.completedCount >= ws.airedCount
+                val progressText = if (ws.airedCount > 0) {
+                    if (isCompleted) "${ws.completedCount}/${ws.airedCount} eps"
+                    else "Watching: ${ws.completedCount}/${ws.airedCount} eps"
+                } else {
+                    "${ws.completedCount} eps watched"
+                }
+
+                if (existing != null) {
+                    if (existing.status == MovieStatus.DROPPED && !isCompleted) continue
+                    val targetStatus = if (isCompleted) MovieStatus.WATCHED else existing.status
+                    val newDate = if (isCompleted && dateIso.isNotBlank() && (existing.watchedDate.isBlank() || dateIso > existing.watchedDate)) {
+                        dateIso
+                    } else existing.watchedDate
+                    val newRw = if (isCompleted) maxOf(existing.rewatchCount, 1) else existing.rewatchCount
+
+                    if (existing.status != targetStatus || existing.episodeProgress != progressText || existing.watchedDate != newDate) {
+                        val updated = existing.copy(
+                            imdbId = existing.imdbId.ifBlank { ws.imdbId },
+                            imdbUrl = existing.imdbUrl.ifBlank { if (ws.imdbId.isNotBlank()) "https://www.imdb.com/title/${ws.imdbId}/" else "" },
+                            status = targetStatus,
+                            watchedDate = newDate,
+                            rewatchCount = newRw,
+                            episodeProgress = progressText,
+                            updatedAt = System.currentTimeMillis()
+                        )
+                        db.update(TABLE_MOVIES, updated.toContentValues(), "id = ?", arrayOf(existing.id.toString()))
+                        indexItem(updated)
+                        seasonsUpdated++
+                    }
+                } else {
+                    val now = System.currentTimeMillis()
+                    val item = MovieItem(
+                        title = ws.showTitle,
+                        type = "Series",
+                        releaseYear = ws.showYear,
+                        imdbId = ws.imdbId,
+                        imdbUrl = if (ws.imdbId.isNotBlank()) "https://www.imdb.com/title/${ws.imdbId}/" else "",
+                        seasonNumber = ws.seasonNumber,
+                        status = if (isCompleted) MovieStatus.WATCHED else MovieStatus.WATCHLIST,
+                        watchedDate = if (isCompleted) dateIso else "",
+                        rewatchCount = if (isCompleted) 1 else 0,
+                        episodeProgress = progressText,
+                        createdAt = now,
+                        updatedAt = now
+                    )
+                    val id = db.insert(TABLE_MOVIES, null, item.toContentValues())
+                    if (id != -1L) {
+                        indexItem(item.copy(id = id))
+                        seasonsAdded++
+                    }
+                }
+            }
+
+            // 3. Watchlist
+            for (wl in watchlistItems) {
+                val seasonNum = if (wl.type == "Series") (wl.seasonNumber ?: 1) else 0
+                val existing = if (wl.type == "Series") {
+                    findMatch(wl.imdbId, wl.title, seasonNum)
+                        ?: all.firstOrNull {
+                            it.type == "Series" &&
+                                ((wl.imdbId.isNotBlank() && it.imdbId.equals(wl.imdbId, true)) ||
+                                    it.title.equals(wl.title, true))
+                        }
+                } else {
+                    findMatch(wl.imdbId, wl.title, 0)
+                }
+
+                if (existing == null) {
+                    val now = System.currentTimeMillis()
+                    val item = MovieItem(
+                        title = wl.title,
+                        type = wl.type,
+                        releaseYear = wl.year,
+                        imdbId = wl.imdbId,
+                        imdbUrl = if (wl.imdbId.isNotBlank()) "https://www.imdb.com/title/${wl.imdbId}/" else "",
+                        seasonNumber = if (wl.type == "Series") seasonNum else null,
+                        status = MovieStatus.WATCHLIST,
+                        createdAt = now,
+                        updatedAt = now
+                    )
+                    val id = db.insert(TABLE_MOVIES, null, item.toContentValues())
+                    if (id != -1L) {
+                        val saved = item.copy(id = id)
+                        all.add(saved)
+                        indexItem(saved)
+                        watchlistAdded++
+                    }
+                }
+            }
+
+            // 4. Ratings
+            for (rt in ratings) {
+                if (rt.type == "Movie") {
+                    val existing = findMatch(rt.imdbId, rt.title, 0)
+                    if (existing != null && existing.personalRating == null) {
+                        val updated = existing.copy(personalRating = rt.rating.toDouble(), updatedAt = System.currentTimeMillis())
+                        db.update(TABLE_MOVIES, updated.toContentValues(), "id = ?", arrayOf(existing.id.toString()))
+                        indexItem(updated)
+                        ratingsUpdated++
+                    }
+                } else {
+                    val matches = getAllMovies().filter {
+                        it.type == "Series" &&
+                            ((rt.imdbId.isNotBlank() && it.imdbId.equals(rt.imdbId, true)) ||
+                                it.title.equals(rt.title, true)) &&
+                            it.personalRating == null
+                    }
+                    for (m in matches) {
+                        val updated = m.copy(personalRating = rt.rating.toDouble(), updatedAt = System.currentTimeMillis())
+                        db.update(TABLE_MOVIES, updated.toContentValues(), "id = ?", arrayOf(m.id.toString()))
+                        ratingsUpdated++
+                    }
+                }
+            }
+
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+
+        return TraktSyncSummary(
+            moviesAdded = moviesAdded,
+            moviesUpdated = moviesUpdated,
+            seasonsAdded = seasonsAdded,
+            seasonsUpdated = seasonsUpdated,
+            watchlistAdded = watchlistAdded,
+            ratingsUpdated = ratingsUpdated
+        )
     }
 
     private fun duplicateKey(item: MovieItem): String? {
@@ -521,13 +983,15 @@ object CsvAndBackupHelper {
                 put("plot", m.plot)
                 put("posterUrl", m.posterUrl)
                 put("notes", m.notes)
+                put("episodeProgress", m.episodeProgress)
+                put("seriesEnded", m.seriesEnded)
                 put("createdAt", m.createdAt)
                 put("updatedAt", m.updatedAt)
             })
         }
         return JSONObject().apply {
             put("app", "MovieTracker")
-            put("version", 1)
+            put("version", 2)
             put("exportedAt", System.currentTimeMillis())
             put("movies", arr)
         }.toString(2)
@@ -556,6 +1020,8 @@ object CsvAndBackupHelper {
                     plot = o.optString("plot", ""),
                     posterUrl = o.optString("posterUrl", ""),
                     notes = o.optString("notes", ""),
+                    episodeProgress = o.optString("episodeProgress", ""),
+                    seriesEnded = o.optBoolean("seriesEnded", false),
                     createdAt = o.optLong("createdAt", System.currentTimeMillis()),
                     updatedAt = o.optLong("updatedAt", System.currentTimeMillis())
                 )
@@ -566,7 +1032,7 @@ object CsvAndBackupHelper {
 
     fun exportToCsv(movies: List<MovieItem>): String {
         val sb = StringBuilder()
-        sb.appendLine("Title,Type,Release,IMDB link,Watched date,Rewatch,IMDb Rating,Personal Rating,Genres,Notes")
+        sb.appendLine("Title,Type,Release,IMDB link,Watched date,Rewatch,IMDb Rating,Personal Rating,Genres,Progress,Notes")
         for (m in movies) {
             val fullTitle = if (m.seasonNumber != null && m.seasonNumber > 0) {
                 "${m.title} - S${m.seasonNumber.toString().padStart(2, '0')}"
@@ -589,6 +1055,7 @@ object CsvAndBackupHelper {
                 m.imdbRating?.toString() ?: "",
                 m.personalRating?.toString() ?: "",
                 m.genres,
+                m.episodeProgress,
                 m.notes
             ).joinToString(",") { csvEscape(it) }
             sb.appendLine(row)
