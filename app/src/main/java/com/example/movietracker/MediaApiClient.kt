@@ -21,6 +21,24 @@ data class ApiMediaResult(
     val totalSeasons: Int? = null
 )
 
+data class TmdbSeasonInfo(
+    val seasonNumber: Int,
+    val episodeCount: Int,
+    val airDate: String // YYYY-MM-DD hoặc ""
+) {
+    val airYear: Int get() = airDate.take(4).toIntOrNull() ?: 0
+}
+
+data class TmdbSeriesDetails(
+    val status: String, // "Returning Series", "Ended", "Canceled", ...
+    val seasons: List<TmdbSeasonInfo>,
+    val posterUrl: String = "",
+    val plot: String = ""
+) {
+    val isEndedOrCanceled: Boolean
+        get() = status.equals("Ended", ignoreCase = true) || status.equals("Canceled", ignoreCase = true)
+}
+
 object MediaApiClient {
 
     private fun httpGet(urlStr: String, bearerToken: String? = null): String {
@@ -206,6 +224,44 @@ object MediaApiClient {
                 }
                 else -> null
             }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun fetchTmdbSeriesDetails(imdbId: String, title: String, tmdbKey: String): TmdbSeriesDetails? {
+        if (tmdbKey.isBlank()) return null
+        val tvId = if (imdbId.isNotBlank()) {
+            findTmdbByImdbId(imdbId, tmdbKey)?.takeIf { it.type == "Series" }?.tmdbId
+        } else {
+            searchTmdb(title, tmdbKey).firstOrNull { it.type == "Series" }?.tmdbId
+        } ?: return null
+
+        return try {
+            val json = tmdbGet("/tv/$tvId", tmdbKey)
+            val status = json.optString("status", "")
+            val posterPath = json.optString("poster_path")
+            val posterUrl = if (posterPath.isNotBlank() && posterPath != "null") {
+                "https://image.tmdb.org/t/p/w342$posterPath"
+            } else ""
+            val plot = json.optString("overview").takeIf { it != "null" } ?: ""
+            val arr = json.optJSONArray("seasons") ?: return TmdbSeriesDetails(status, emptyList(), posterUrl, plot)
+            val list = mutableListOf<TmdbSeasonInfo>()
+            for (i in 0 until arr.length()) {
+                val s = arr.getJSONObject(i)
+                val num = s.optInt("season_number", 0)
+                if (num <= 0) continue
+                val rawDate = s.optString("air_date", "")
+                val airDate = if (rawDate.equals("null", true)) "" else rawDate.trim()
+                list.add(
+                    TmdbSeasonInfo(
+                        seasonNumber = num,
+                        episodeCount = s.optInt("episode_count", 0),
+                        airDate = airDate
+                    )
+                )
+            }
+            TmdbSeriesDetails(status = status, seasons = list.sortedBy { it.seasonNumber }, posterUrl = posterUrl, plot = plot)
         } catch (_: Exception) {
             null
         }
