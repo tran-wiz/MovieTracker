@@ -134,7 +134,9 @@ object TraktClient {
         val body = JSONObject()
             .put("code", deviceCode)
             .put("client_id", clientId.trim())
-            .put("client_secret", clientSecret.trim())
+            .apply {
+                if (clientSecret.isNotBlank()) put("client_secret", clientSecret.trim())
+            }
         val resp = request("POST", "/oauth/device/token", clientId, jsonBody = body)
         return when (resp.code) {
             200 -> parseTokenResponse(resp.body)
@@ -149,9 +151,10 @@ object TraktClient {
         val body = JSONObject()
             .put("refresh_token", refreshToken)
             .put("client_id", clientId.trim())
-            .put("client_secret", clientSecret.trim())
-            .put("redirect_uri", "urn:ietf:wg:oauth:2.0:oob")
             .put("grant_type", "refresh_token")
+            .apply {
+                if (clientSecret.isNotBlank()) put("client_secret", clientSecret.trim())
+            }
         val resp = request("POST", "/oauth/token", clientId, jsonBody = body)
         if (resp.code !in 200..299) {
             throw IllegalStateException("Token refresh failed (${resp.code}). Please reconnect Trakt.")
