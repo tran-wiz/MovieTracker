@@ -8,6 +8,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -43,6 +44,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -116,6 +118,127 @@ fun MovieTrackerTheme(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = scheme, content = content)
 }
 
+data class NewSeasonCheckSummary(
+    val checkedSeries: Int,
+    val addedLabels: List<String>,
+    val markedEnded: Int
+)
+
+private suspend fun runNewSeasonsCheck(
+    db: MovieDatabaseHelper,
+    tmdbKey: String,
+    onProgress: (String) -> Unit = {}
+): NewSeasonCheckSummary {
+    val candidates = db.getSeriesCandidatesForNewSeasons()
+    val today = CsvAndBackupHelper.todayIsoDate()
+    val toInsert = mutableListOf<MovieItem>()
+    val addedLabels = mutableListOf<String>()
+    var markedEnded = 0
+
+    candidates.forEachIndexed { idx, c ->
+        withContext(Dispatchers.Main) {
+            onProgress("Checking ${idx + 1}/${candidates.size}: ${c.title}")
+        }
+        val details = MediaApiClient.fetchTmdbSeriesDetails(c.imdbId, c.title, tmdbKey)
+        if (details != null) {
+            val newAiredSeasons = details.seasons.filter { s ->
+                s.seasonNumber > c.maxSeasonNumber &&
+                    s.episodeCount > 0 &&
+                    s.airDate.length >= 10 &&
+                    s.airDate <= today
+            }
+            for (s in newAiredSeasons) {
+                toInsert.add(
+                    MovieItem(
+                        title = c.title,
+                        type = "Series",
+                        releaseYear = if (s.airYear > 0) s.airYear else c.releaseYear,
+                        imdbId = c.imdbId,
+                        imdbUrl = c.imdbUrl,
+                        seasonNumber = s.seasonNumber,
+                        status = MovieStatus.WATCHLIST,
+                        imdbRating = c.imdbRating,
+                        genres = c.genres,
+                        plot = c.plot.ifBlank { details.plot },
+                        posterUrl = c.posterUrl.ifBlank { details.posterUrl },
+                        seriesEnded = details.isEndedOrCanceled
+                    )
+                )
+                addedLabels.add("${c.title} S${s.seasonNumber.toString().padStart(2, '0')}")
+            }
+            if (details.isEndedOrCanceled) {
+                db.markSeriesEnded(c.seasonIds)
+                markedEnded++
+            }
+        }
+        delay(100)
+    }
+
+    val actuallyInserted = db.insertNewSeasonsSafely(toInsert)
+    val finalLabels = if (actuallyInserted > 0) addedLabels.take(actuallyInserted) else emptyList()
+    return NewSeasonCheckSummary(
+        checkedSeries = candidates.size,
+        addedLabels = finalLabels,
+        markedEnded = markedEnded
+    )
+}
+
+private fun writeAutoBackupToFolder(context: Context, db: MovieDatabaseHelper, folderUriStr: String): Boolean {
+    if (folderUriStr.isBlank()) return false
+    return try {
+        val treeUri = Uri.parse(folderUriStr)
+        val treeDocId = DocumentsContract.getTreeDocumentId(treeUri)
+        val parentDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocId)
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId)
+        val fileName = "MovieTracker_AutoBackup.json"
+
+        var existingDocUri: Uri? = null
+        context.contentResolver.query(
+            childrenUri,
+            arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+            null,
+            null,
+            null
+        )?.use { c ->
+            while (c.moveToNext()) {
+                if (c.getString(1) == fileName) {
+                    existingDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, c.getString(0))
+                    break
+                }
+            }
+        }
+
+        val targetUri = existingDocUri ?: DocumentsContract.createDocument(
+            context.contentResolver,
+            parentDocUri,
+            "application/json",
+            fileName
+        ) ?: return false
+
+        val jsonText = CsvAndBackupHelper.exportToJson(db.getAllMovies())
+        context.contentResolver.openOutputStream(targetUri, "wt")?.use {
+            it.write(jsonText.toByteArray(Charsets.UTF_8))
+        }
+        true
+    } catch (_: Exception) {
+        false
+    }
+}
+
+private fun shareBackupFileToDrive(context: Context, db: MovieDatabaseHelper) {
+    val dir = File(context.cacheDir, "backups").apply { if (!exists()) mkdirs() }
+    val outFile = File(dir, "MovieTracker_Backup_${CsvAndBackupHelper.todayIsoDate()}.json")
+    outFile.writeText(CsvAndBackupHelper.exportToJson(db.getAllMovies()), Charsets.UTF_8)
+    val uri = FileProvider.getUriForFile(context, "com.example.movietracker.fileprovider", outFile)
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "application/json"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        putExtra(Intent.EXTRA_SUBJECT, outFile.name)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    context.startActivity(Intent.createChooser(intent, "Send backup to Google Drive"))
+}
+
 @Composable
 fun MovieTrackerApp(
     incomingShareText: String?,
@@ -128,6 +251,9 @@ fun MovieTrackerApp(
 
     var omdbKey by remember { mutableStateOf(prefs.getString("omdb_key", "") ?: "") }
     var tmdbKey by remember { mutableStateOf(prefs.getString("tmdb_key", "") ?: "") }
+    var autoBackupEnabled by remember { mutableStateOf(prefs.getBoolean("auto_backup_enabled", false)) }
+    var autoBackupUri by remember { mutableStateOf(prefs.getString("auto_backup_uri", "") ?: "") }
+    var autoCheckNewSeasons by remember { mutableStateOf(prefs.getBoolean("auto_check_new_seasons", true)) }
 
     var searchQuery by remember { mutableStateOf("") }
     var statusFilter by remember { mutableStateOf<MovieStatus?>(null) }
@@ -135,22 +261,57 @@ fun MovieTrackerApp(
     var sortOption by remember { mutableStateOf(SortOption.UPDATED_DESC) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
 
-    var movies by remember { mutableStateOf<List<MovieItem>>(emptyList()) }
+    var allMovies by remember { mutableStateOf<List<MovieItem>>(emptyList()) }
+    var entries by remember { mutableStateOf<List<LibraryEntry>>(emptyList()) }
     var stats by remember { mutableStateOf(MovieStats()) }
 
     var selectedMovie by remember { mutableStateOf<MovieItem?>(null) }
+    var selectedSeriesKey by remember { mutableStateOf<String?>(null) }
     var showAddDialog by remember { mutableStateOf(false) }
     var addInitialQuery by remember { mutableStateOf("") }
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showSortMenu by remember { mutableStateOf(false) }
+    var hasRunDailySeasonCheck by remember { mutableStateOf(false) }
+
+    fun triggerDataUpdated(runAutoBackup: Boolean = true) {
+        refreshTrigger++
+        if (runAutoBackup && autoBackupEnabled && autoBackupUri.isNotBlank()) {
+            scope.launch(Dispatchers.IO) {
+                writeAutoBackupToFolder(context, db, autoBackupUri)
+            }
+        }
+    }
 
     LaunchedEffect(searchQuery, statusFilter, typeFilter, sortOption, refreshTrigger) {
-        val loaded = withContext(Dispatchers.IO) {
-            db.queryMovies(searchQuery, statusFilter, typeFilter, sortOption)
+        val (loadedAll, builtEntries, st) = withContext(Dispatchers.IO) {
+            val raw = db.getAllMovies()
+            val grouped = buildLibraryEntries(raw, searchQuery, statusFilter, typeFilter, sortOption)
+            Triple(raw, grouped, db.getStats())
         }
-        val st = withContext(Dispatchers.IO) { db.getStats() }
-        movies = loaded
+        allMovies = loadedAll
+        entries = builtEntries
         stats = st
+    }
+
+    // Tự động kiểm tra mùa mới 1 lần/ngày khi mở app có TMDB Key
+    LaunchedEffect(allMovies.isNotEmpty(), tmdbKey, autoCheckNewSeasons) {
+        if (!hasRunDailySeasonCheck && allMovies.isNotEmpty() && autoCheckNewSeasons && tmdbKey.isNotBlank()) {
+            hasRunDailySeasonCheck = true
+            val lastCheck = prefs.getLong("last_new_season_check", 0L)
+            val oneDayMs = 24L * 60L * 60L * 1000L
+            if (System.currentTimeMillis() - lastCheck > oneDayMs) {
+                val summary = withContext(Dispatchers.IO) {
+                    runCatching { runNewSeasonsCheck(db, tmdbKey) }.getOrNull()
+                }
+                prefs.edit().putLong("last_new_season_check", System.currentTimeMillis()).apply()
+                if (summary != null && summary.addedLabels.isNotEmpty()) {
+                    triggerDataUpdated()
+                    val preview = summary.addedLabels.take(3).joinToString(", ")
+                    val more = if (summary.addedLabels.size > 3) " +${summary.addedLabels.size - 3} more" else ""
+                    Toast.makeText(context, "New seasons added to Watchlist: $preview$more", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
     }
 
     LaunchedEffect(incomingShareText) {
@@ -161,6 +322,13 @@ fun MovieTrackerApp(
         }
     }
 
+    val activeSeriesGroup = remember(selectedSeriesKey, allMovies) {
+        val key = selectedSeriesKey ?: return@remember null
+        buildLibraryEntries(allMovies, "", null, "Series", SortOption.TITLE_ASC)
+            .filterIsInstance<SeriesGroupEntry>()
+            .firstOrNull { it.groupKey == key }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -168,7 +336,7 @@ fun MovieTrackerApp(
                     Column {
                         Text("MovieTracker", fontWeight = FontWeight.Bold, fontSize = 20.sp)
                         Text(
-                            "${stats.total} titles • ${stats.watched} watched • ${stats.watchlist} watchlist",
+                            "${stats.total} entries • ${stats.watched} watched • ${stats.watchlist} watchlist",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -226,7 +394,7 @@ fun MovieTrackerApp(
                     FilterChip(
                         selected = statusFilter == null,
                         onClick = { statusFilter = null },
-                        label = { Text("All (${stats.total})") }
+                        label = { Text("All") }
                     )
                 }
                 item {
@@ -275,7 +443,7 @@ fun MovieTrackerApp(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "${movies.size} showing",
+                    "${entries.size} titles",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -300,7 +468,7 @@ fun MovieTrackerApp(
                 }
             }
 
-            if (movies.isEmpty()) {
+            if (entries.isEmpty()) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -316,7 +484,7 @@ fun MovieTrackerApp(
                         Spacer(Modifier.height(8.dp))
                         Text(
                             if (stats.total == 0) {
-                                "Tap Settings (top right) to import your Google Sheets CSV, or tap + to add a title."
+                                "Tap Settings (top right) to import CSV or connect Trakt, or tap + to add a title."
                             } else {
                                 "Try a different search query or clear your filters."
                             },
@@ -326,7 +494,7 @@ fun MovieTrackerApp(
                         if (stats.total == 0) {
                             Spacer(Modifier.height(14.dp))
                             Button(onClick = { showSettingsDialog = true }) {
-                                Text("Import CSV")
+                                Text("Open Settings")
                             }
                         }
                     }
@@ -337,15 +505,128 @@ fun MovieTrackerApp(
                     contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 88.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(movies, key = { it.id }) { movie ->
-                        MovieRowCard(
-                            movie = movie,
-                            onClick = { selectedMovie = movie }
-                        )
+                    items(
+                        items = entries,
+                        key = {
+                            when (it) {
+                                is SingleLibraryEntry -> "m_${it.item.id}"
+                                is SeriesGroupEntry -> "s_${it.groupKey}"
+                            }
+                        }
+                    ) { entry ->
+                        when (entry) {
+                            is SingleLibraryEntry -> MovieRowCard(
+                                movie = entry.item,
+                                onClick = { selectedMovie = entry.item }
+                            )
+                            is SeriesGroupEntry -> SeriesGroupCard(
+                                group = entry,
+                                onClick = { selectedSeriesKey = entry.groupKey }
+                            )
+                        }
                     }
                 }
             }
         }
+    }
+
+    activeSeriesGroup?.let { group ->
+        SeriesDetailDialog(
+            group = group,
+            omdbKey = omdbKey,
+            tmdbKey = tmdbKey,
+            onDismiss = { selectedSeriesKey = null },
+            onSelectSeason = { season -> selectedMovie = season },
+            onQuickMarkWatched = { season ->
+                scope.launch(Dispatchers.IO) {
+                    db.updateMovie(
+                        season.copy(
+                            status = MovieStatus.WATCHED,
+                            watchedDate = season.watchedDate.ifBlank { CsvAndBackupHelper.todayIsoDate() },
+                            rewatchCount = maxOf(season.rewatchCount, 1)
+                        )
+                    )
+                    withContext(Dispatchers.Main) {
+                        triggerDataUpdated()
+                    }
+                }
+            },
+            onAddSeason = { nextNum ->
+                scope.launch(Dispatchers.IO) {
+                    db.insertMovie(
+                        MovieItem(
+                            title = group.title,
+                            type = "Series",
+                            releaseYear = group.releaseYear,
+                            imdbId = group.imdbId,
+                            imdbUrl = group.imdbUrl,
+                            seasonNumber = nextNum,
+                            status = MovieStatus.WATCHLIST,
+                            imdbRating = group.imdbRating,
+                            genres = group.genres,
+                            plot = group.plot,
+                            posterUrl = group.posterUrl
+                        )
+                    )
+                    withContext(Dispatchers.Main) {
+                        triggerDataUpdated()
+                        Toast.makeText(context, "Added Season $nextNum", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            },
+            onSyncSeriesInfo = { res, tmdbDetails ->
+                scope.launch(Dispatchers.IO) {
+                    val today = CsvAndBackupHelper.todayIsoDate()
+                    val existingNums = group.seasons.mapNotNull { it.seasonNumber }.toSet()
+                    val endedFlag = tmdbDetails?.isEndedOrCanceled ?: group.seriesEnded
+                    for (s in group.seasons) {
+                        db.updateMovie(
+                            s.copy(
+                                imdbId = s.imdbId.ifBlank { res?.imdbId ?: "" },
+                                imdbRating = res?.imdbRating ?: s.imdbRating,
+                                genres = s.genres.ifBlank { res?.genres ?: "" },
+                                plot = s.plot.ifBlank { res?.plot ?: tmdbDetails?.plot ?: "" },
+                                posterUrl = res?.posterUrl?.ifBlank { null } ?: s.posterUrl.ifBlank { tmdbDetails?.posterUrl ?: "" },
+                                seriesEnded = endedFlag
+                            )
+                        )
+                    }
+                    var addedSeasons = 0
+                    val maxExisting = existingNums.maxOrNull() ?: 0
+                    val tmdbSeasons = tmdbDetails?.seasons.orEmpty()
+                    for (ts in tmdbSeasons) {
+                        val shouldAdd = ts.seasonNumber !in existingNums &&
+                            ts.episodeCount > 0 &&
+                            (ts.seasonNumber <= maxExisting || (ts.airDate.length >= 10 && ts.airDate <= today))
+                        if (shouldAdd) {
+                            db.insertMovie(
+                                MovieItem(
+                                    title = group.title,
+                                    type = "Series",
+                                    releaseYear = if (ts.airYear > 0) ts.airYear else group.releaseYear,
+                                    imdbId = group.imdbId.ifBlank { res?.imdbId ?: "" },
+                                    imdbUrl = group.imdbUrl,
+                                    seasonNumber = ts.seasonNumber,
+                                    status = MovieStatus.WATCHLIST,
+                                    imdbRating = res?.imdbRating ?: group.imdbRating,
+                                    genres = res?.genres?.ifBlank { null } ?: group.genres,
+                                    plot = res?.plot?.ifBlank { null } ?: group.plot.ifBlank { tmdbDetails?.plot ?: "" },
+                                    posterUrl = res?.posterUrl?.ifBlank { null } ?: group.posterUrl.ifBlank { tmdbDetails?.posterUrl ?: "" },
+                                    seriesEnded = endedFlag
+                                )
+                            )
+                            addedSeasons++
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        triggerDataUpdated()
+                        val ratingNote = if (res?.imdbRating != null) "IMDb: ${res.imdbRating}" else "No IMDb rating on OMDb yet"
+                        val seasonNote = if (addedSeasons > 0) " • +$addedSeasons seasons" else ""
+                        Toast.makeText(context, "Synced ($ratingNote)$seasonNote", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        )
     }
 
     selectedMovie?.let { movie ->
@@ -359,7 +640,7 @@ fun MovieTrackerApp(
                     db.updateMovie(updated)
                     withContext(Dispatchers.Main) {
                         selectedMovie = null
-                        refreshTrigger++
+                        triggerDataUpdated()
                         Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -369,7 +650,7 @@ fun MovieTrackerApp(
                     db.deleteMovie(toDelete.id)
                     withContext(Dispatchers.Main) {
                         selectedMovie = null
-                        refreshTrigger++
+                        triggerDataUpdated()
                         Toast.makeText(context, "Deleted ${toDelete.displayTitle()}", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -386,14 +667,18 @@ fun MovieTrackerApp(
             onDismiss = { showAddDialog = false },
             onOpenExisting = { existing ->
                 showAddDialog = false
-                selectedMovie = existing
+                if (existing.type.equals("Series", true)) {
+                    selectedSeriesKey = existing.seriesGroupKey()
+                } else {
+                    selectedMovie = existing
+                }
             },
             onAddNew = { newMovie ->
                 scope.launch(Dispatchers.IO) {
                     db.insertMovie(newMovie)
                     withContext(Dispatchers.Main) {
                         showAddDialog = false
-                        refreshTrigger++
+                        triggerDataUpdated()
                         Toast.makeText(context, "Added ${newMovie.displayTitle()}", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -404,8 +689,12 @@ fun MovieTrackerApp(
     if (showSettingsDialog) {
         SettingsAndBackupDialog(
             db = db,
+            prefs = prefs,
             omdbKey = omdbKey,
             tmdbKey = tmdbKey,
+            autoBackupEnabled = autoBackupEnabled,
+            autoBackupUri = autoBackupUri,
+            autoCheckNewSeasons = autoCheckNewSeasons,
             onSaveKeys = { newOmdb, newTmdb ->
                 omdbKey = newOmdb.trim()
                 tmdbKey = newTmdb.trim()
@@ -415,9 +704,373 @@ fun MovieTrackerApp(
                     .apply()
                 Toast.makeText(context, "API Keys saved", Toast.LENGTH_SHORT).show()
             },
-            onDataChanged = { refreshTrigger++ },
+            onToggleAutoCheckSeasons = { enabled ->
+                autoCheckNewSeasons = enabled
+                prefs.edit().putBoolean("auto_check_new_seasons", enabled).apply()
+            },
+            onUpdateAutoBackup = { enabled, uriStr ->
+                autoBackupEnabled = enabled
+                autoBackupUri = uriStr
+                prefs.edit()
+                    .putBoolean("auto_backup_enabled", enabled)
+                    .putString("auto_backup_uri", uriStr)
+                    .apply()
+                if (enabled && uriStr.isNotBlank()) {
+                    scope.launch(Dispatchers.IO) {
+                        val ok = writeAutoBackupToFolder(context, db, uriStr)
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                context,
+                                if (ok) "Auto-backup file updated!" else "Failed to write to folder",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                }
+            },
+            onDataChanged = { triggerDataUpdated() },
             onDismiss = { showSettingsDialog = false }
         )
+    }
+}
+
+@Composable
+fun SeriesGroupCard(group: SeriesGroupEntry, onClick: () -> Unit) {
+    val totalSeasons = group.seasons.size
+    val progressRatio = if (totalSeasons > 0) group.watchedCount.toFloat() / totalSeasons.toFloat() else 0f
+    val pillColor = when {
+        group.activeWatchingNote.isNotBlank() -> Color(0xFF1565C0)
+        group.watchedCount == totalSeasons && totalSeasons > 0 -> Color(0xFF2E7D32)
+        group.droppedCount == totalSeasons && totalSeasons > 0 -> Color(0xFFC62828)
+        else -> Color(0xFF1565C0)
+    }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Row(
+            modifier = Modifier.padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            PosterThumbnail(
+                posterUrl = group.posterUrl,
+                title = group.title,
+                modifier = Modifier
+                    .width(54.dp)
+                    .height(80.dp)
+                    .clip(RoundedCornerShape(8.dp))
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = group.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(2.dp))
+                val yearText = if (group.releaseYear > 0) " • ${group.releaseYear}" else ""
+                Text(
+                    text = "Series$yearText • $totalSeasons ${if (totalSeasons == 1) "season" else "seasons"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (group.genres.isNotBlank()) {
+                    Text(
+                        text = group.genres,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                LinearProgressIndicator(
+                    progress = { progressRatio },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(5.dp)
+                        .clip(RoundedCornerShape(3.dp)),
+                    color = Color(0xFF2E7D32),
+                    trackColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+                Spacer(Modifier.height(5.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    val label = when {
+                        group.activeWatchingNote.isNotBlank() -> group.activeWatchingNote
+                        group.watchedCount == totalSeasons && totalSeasons > 0 -> "Watched all ($totalSeasons/$totalSeasons)"
+                        group.droppedCount == totalSeasons && totalSeasons > 0 -> "Dropped"
+                        else -> "${group.watchedCount}/$totalSeasons watched"
+                    }
+                    Surface(
+                        color = pillColor.copy(alpha = 0.16f),
+                        shape = RoundedCornerShape(6.dp)
+                    ) {
+                        Text(
+                            text = label,
+                            color = pillColor,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+            if (group.imdbRating != null || group.avgPersonalRating != null) {
+                Column(
+                    horizontalAlignment = Alignment.End,
+                    modifier = Modifier.padding(start = 8.dp)
+                ) {
+                    if (group.imdbRating != null) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(AppIcons.Star, null, tint = Color(0xFFF5C518), modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(2.dp))
+                            Text(String.format(Locale.US, "%.1f", group.imdbRating), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        }
+                    }
+                    if (group.avgPersonalRating != null) {
+                        Text(
+                            text = "Me: ${String.format(Locale.US, "%.1f", group.avgPersonalRating)}",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.secondary,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SeriesDetailDialog(
+    group: SeriesGroupEntry,
+    omdbKey: String,
+    tmdbKey: String,
+    onDismiss: () -> Unit,
+    onSelectSeason: (MovieItem) -> Unit,
+    onQuickMarkWatched: (MovieItem) -> Unit,
+    onAddSeason: (Int) -> Unit,
+    onSyncSeriesInfo: (ApiMediaResult?, TmdbSeriesDetails?) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var isSyncing by remember { mutableStateOf(false) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.94f)
+                .fillMaxHeight(0.9f),
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surface
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                TopAppBar(
+                    title = {
+                        Text(
+                            group.title,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = onDismiss) { Icon(AppIcons.Close, "Close") }
+                    }
+                )
+
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    item {
+                        Row(verticalAlignment = Alignment.Top) {
+                            PosterThumbnail(
+                                posterUrl = group.posterUrl,
+                                title = group.title,
+                                modifier = Modifier
+                                    .width(86.dp)
+                                    .height(128.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(group.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                val yearLabel = if (group.releaseYear > 0) "${group.releaseYear} • " else ""
+                                val endedLabel = if (group.seriesEnded) " • Ended" else ""
+                                Text(
+                                    "${yearLabel}${group.watchedCount}/${group.seasons.size} watched$endedLabel",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                if (group.imdbRating != null) {
+                                    Spacer(Modifier.height(4.dp))
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(AppIcons.Star, null, tint = Color(0xFFF5C518), modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("IMDb ${group.imdbRating} / 10", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                    }
+                                }
+                                if (group.genres.isNotBlank()) {
+                                    Text(group.genres, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                                Spacer(Modifier.height(8.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    val url = group.imdbUrl.ifBlank {
+                                        if (group.imdbId.isNotBlank()) "https://www.imdb.com/title/${group.imdbId}/" else ""
+                                    }
+                                    if (url.isNotBlank()) {
+                                        OutlinedButton(
+                                            onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                        ) {
+                                            Icon(AppIcons.OpenInNew, null, modifier = Modifier.size(15.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("IMDb", fontSize = 12.sp)
+                                        }
+                                    }
+                                    OutlinedButton(
+                                        enabled = !isSyncing,
+                                        onClick = {
+                                            if (omdbKey.isBlank() && tmdbKey.isBlank()) {
+                                                Toast.makeText(context, "Add OMDb/TMDB key in Settings first", Toast.LENGTH_SHORT).show()
+                                                return@OutlinedButton
+                                            }
+                                            isSyncing = true
+                                            scope.launch(Dispatchers.IO) {
+                                                val res = MediaApiClient.enrichFromApis(
+                                                    title = group.title,
+                                                    year = group.releaseYear,
+                                                    imdbId = group.imdbId,
+                                                    isSeries = true,
+                                                    tmdbId = null,
+                                                    omdbKey = omdbKey,
+                                                    tmdbKey = tmdbKey
+                                                )
+                                                val tmdbDetails = if (tmdbKey.isNotBlank()) {
+                                                    MediaApiClient.fetchTmdbSeriesDetails(group.imdbId.ifBlank { res?.imdbId ?: "" }, group.title, tmdbKey)
+                                                } else null
+                                                withContext(Dispatchers.Main) {
+                                                    isSyncing = false
+                                                    onSyncSeriesInfo(res, tmdbDetails)
+                                                }
+                                            }
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                    ) {
+                                        Icon(AppIcons.Refresh, null, modifier = Modifier.size(15.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text(if (isSyncing) "..." else "Sync Seasons", fontSize = 12.sp)
+                                    }
+                                }
+                            }
+                        }
+                        if (group.plot.isNotBlank()) {
+                            Spacer(Modifier.height(8.dp))
+                            Text(group.plot, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Seasons", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                            val nextNum = (group.seasons.mapNotNull { it.seasonNumber }.maxOrNull() ?: 0) + 1
+                            TextButton(onClick = { onAddSeason(nextNum) }) {
+                                Text("+ Add S${nextNum.toString().padStart(2, '0')}")
+                            }
+                        }
+                    }
+
+                    items(group.seasons, key = { it.id }) { season ->
+                        val sColor = when (season.status) {
+                            MovieStatus.WATCHED -> Color(0xFF2E7D32)
+                            MovieStatus.WATCHLIST -> Color(0xFF1565C0)
+                            MovieStatus.DROPPED -> Color(0xFFC62828)
+                        }
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelectSeason(season) },
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    val sLabel = season.seasonNumber?.let { "Season ${it.toString().padStart(2, '0')}" } ?: "Season"
+                                    val yr = if (season.releaseYear > 0) " (${season.releaseYear})" else ""
+                                    Text("$sLabel$yr", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                    Spacer(Modifier.height(3.dp))
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        val stText = if (season.status == MovieStatus.WATCHED && season.watchedDate.isNotBlank()) {
+                                            "Watched • ${season.watchedDate}"
+                                        } else season.status.label
+                                        Surface(color = sColor.copy(alpha = 0.16f), shape = RoundedCornerShape(5.dp)) {
+                                            Text(
+                                                stText,
+                                                color = sColor,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                        if (season.episodeProgress.isNotBlank()) {
+                                            Text(
+                                                season.episodeProgress,
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.secondary,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                        }
+                                        if (season.personalRating != null) {
+                                            Text(
+                                                "Me: ${season.personalRating.toInt()}/10",
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+                                    if (season.notes.isNotBlank()) {
+                                        Text(
+                                            season.notes,
+                                            fontSize = 11.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                                if (season.status != MovieStatus.WATCHED) {
+                                    IconButton(onClick = { onQuickMarkWatched(season) }) {
+                                        Icon(AppIcons.Check, "Mark Watched", tint = Color(0xFF2E7D32))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -630,8 +1283,10 @@ fun MovieDetailDialog(
     var genres by remember { mutableStateOf(movie.genres) }
     var plot by remember { mutableStateOf(movie.plot) }
     var posterUrl by remember { mutableStateOf(movie.posterUrl) }
+    var episodeProgress by remember { mutableStateOf(movie.episodeProgress) }
     var notes by remember { mutableStateOf(movie.notes) }
 
+    var syncMessage by remember { mutableStateOf("") }
     var isFetching by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
 
@@ -650,13 +1305,11 @@ fun MovieDetailDialog(
                 TopAppBar(
                     title = { Text("Details", fontWeight = FontWeight.Bold) },
                     navigationIcon = {
-                        IconButton(onClick = onDismiss) {
-                            Icon(AppIcons.Close, contentDescription = "Close")
-                        }
+                        IconButton(onClick = onDismiss) { Icon(AppIcons.Close, "Close") }
                     },
                     actions = {
                         IconButton(onClick = { confirmDelete = true }) {
-                            Icon(AppIcons.Delete, contentDescription = "Delete", tint = Color(0xFFE53935))
+                            Icon(AppIcons.Delete, "Delete", tint = Color(0xFFE53935))
                         }
                     }
                 )
@@ -699,9 +1352,7 @@ fun MovieDetailDialog(
                                 }
                                 if (url.isNotBlank()) {
                                     OutlinedButton(
-                                        onClick = {
-                                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                                        },
+                                        onClick = { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) },
                                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                                     ) {
                                         Icon(AppIcons.OpenInNew, null, modifier = Modifier.size(16.dp))
@@ -717,6 +1368,7 @@ fun MovieDetailDialog(
                                             return@OutlinedButton
                                         }
                                         isFetching = true
+                                        syncMessage = ""
                                         scope.launch(Dispatchers.IO) {
                                             val res = MediaApiClient.enrichFromApis(
                                                 title = title,
@@ -736,9 +1388,13 @@ fun MovieDetailDialog(
                                                     if (res.plot.isNotBlank()) plot = res.plot
                                                     if (res.posterUrl.isNotBlank()) posterUrl = res.posterUrl
                                                     if (res.releaseYear > 0 && yearStr.isBlank()) yearStr = res.releaseYear.toString()
-                                                    Toast.makeText(context, "Synced from IMDb/TMDB", Toast.LENGTH_SHORT).show()
+                                                    syncMessage = if (res.imdbRating != null) {
+                                                        "Synced! IMDb: ${res.imdbRating} (tap Save to keep)"
+                                                    } else {
+                                                        "Synced info — OMDb has no IMDb rating for this title yet."
+                                                    }
                                                 } else {
-                                                    Toast.makeText(context, "No new info found", Toast.LENGTH_SHORT).show()
+                                                    syncMessage = "No match found on OMDb or TMDB."
                                                 }
                                             }
                                         }
@@ -749,6 +1405,10 @@ fun MovieDetailDialog(
                                     Spacer(Modifier.width(4.dp))
                                     Text(if (isFetching) "Syncing..." else "Sync", fontSize = 12.sp)
                                 }
+                            }
+                            if (syncMessage.isNotBlank()) {
+                                Spacer(Modifier.height(4.dp))
+                                Text(syncMessage, fontSize = 11.sp, color = MaterialTheme.colorScheme.secondary)
                             }
                         }
                     }
@@ -831,6 +1491,16 @@ fun MovieDetailDialog(
                         }
                     }
 
+                    if (type.equals("Series", true)) {
+                        OutlinedTextField(
+                            value = episodeProgress,
+                            onValueChange = { episodeProgress = it },
+                            label = { Text("Episode Progress (e.g. Watching: 5/12 eps)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
                     OutlinedTextField(
                         value = title,
                         onValueChange = { title = it },
@@ -896,6 +1566,7 @@ fun MovieDetailDialog(
                                 genres = genres,
                                 plot = plot,
                                 posterUrl = posterUrl,
+                                episodeProgress = episodeProgress.trim(),
                                 notes = notes.trim()
                             )
                         )
@@ -987,6 +1658,7 @@ fun AddOrShareMovieDialog(
                         if (enriched != null) {
                             draftTitle = enriched.title
                             draftType = enriched.type
+                            if (enriched.type == "Series" && draftSeason.isBlank()) draftSeason = "1"
                             draftYear = if (enriched.releaseYear > 0) enriched.releaseYear.toString() else ""
                             draftImdbId = enriched.imdbId
                             draftImdbRating = enriched.imdbRating
@@ -1150,6 +1822,7 @@ fun AddOrShareMovieDialog(
                                                 existingMatches = matches
                                                 draftTitle = enriched.title
                                                 draftType = enriched.type
+                                                if (enriched.type == "Series" && draftSeason.isBlank()) draftSeason = "1"
                                                 draftYear = if (enriched.releaseYear > 0) enriched.releaseYear.toString() else ""
                                                 draftImdbId = enriched.imdbId
                                                 draftImdbRating = enriched.imdbRating
@@ -1225,7 +1898,10 @@ fun AddOrShareMovieDialog(
                             listOf("Movie", "Series", "Documentary").forEach { t ->
                                 FilterChip(
                                     selected = draftType == t,
-                                    onClick = { draftType = t },
+                                    onClick = {
+                                        draftType = t
+                                        if (t == "Series" && draftSeason.isBlank()) draftSeason = "1"
+                                    },
                                     label = { Text(t) }
                                 )
                             }
@@ -1313,7 +1989,7 @@ fun AddOrShareMovieDialog(
                                     releaseYear = draftYear.toIntOrNull() ?: 0,
                                     imdbId = draftImdbId.trim(),
                                     imdbUrl = if (draftImdbId.isNotBlank()) "https://www.imdb.com/title/${draftImdbId.trim()}/" else "",
-                                    seasonNumber = draftSeason.toIntOrNull(),
+                                    seasonNumber = if (draftType == "Series") (draftSeason.toIntOrNull() ?: 1) else null,
                                     status = draftStatus,
                                     watchedDate = if (draftStatus == MovieStatus.WATCHED) draftDate.trim() else "",
                                     rewatchCount = if (draftStatus == MovieStatus.WATCHED) 1 else 0,
@@ -1339,9 +2015,15 @@ fun AddOrShareMovieDialog(
 @Composable
 fun SettingsAndBackupDialog(
     db: MovieDatabaseHelper,
+    prefs: android.content.SharedPreferences,
     omdbKey: String,
     tmdbKey: String,
+    autoBackupEnabled: Boolean,
+    autoBackupUri: String,
+    autoCheckNewSeasons: Boolean,
     onSaveKeys: (String, String) -> Unit,
+    onToggleAutoCheckSeasons: (Boolean) -> Unit,
+    onUpdateAutoBackup: (Boolean, String) -> Unit,
     onDataChanged: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -1353,8 +2035,34 @@ fun SettingsAndBackupDialog(
     var mergeDuplicatesOnImport by remember { mutableStateOf(true) }
     var statusBanner by remember { mutableStateOf("") }
 
+    var traktClientId by remember { mutableStateOf(prefs.getString("trakt_client_id", "") ?: "") }
+    var traktClientSecret by remember { mutableStateOf(prefs.getString("trakt_client_secret", "") ?: "") }
+    var traktAccessToken by remember { mutableStateOf(prefs.getString("trakt_access_token", "") ?: "") }
+    var traktRefreshToken by remember { mutableStateOf(prefs.getString("trakt_refresh_token", "") ?: "") }
+    var traktExpiresAt by remember { mutableLongStateOf(prefs.getLong("trakt_expires_at", 0L)) }
+    var pendingDeviceCode by remember { mutableStateOf<TraktDeviceCode?>(null) }
+    var traktStatusText by remember { mutableStateOf("") }
+    var traktBusy by remember { mutableStateOf(false) }
+
+    var seasonCheckJob by remember { mutableStateOf<Job?>(null) }
+    var seasonCheckProgress by remember { mutableStateOf("") }
+
     var enrichJob by remember { mutableStateOf<Job?>(null) }
     var enrichProgress by remember { mutableStateOf("") }
+
+    val folderPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        try {
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            context.contentResolver.takePersistableUriPermission(uri, flags)
+            onUpdateAutoBackup(true, uri.toString())
+            statusBanner = "Auto-backup folder set!"
+        } catch (e: Exception) {
+            statusBanner = "Folder permission error: ${e.message}"
+        }
+    }
 
     val csvPickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -1390,7 +2098,7 @@ fun SettingsAndBackupDialog(
                     it.write(text.toByteArray(Charsets.UTF_8))
                 }
                 withContext(Dispatchers.Main) {
-                    statusBanner = "Backed up ${all.size} titles to JSON!"
+                    statusBanner = "Backed up ${all.size} entries to JSON!"
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) { statusBanner = "Backup error: ${e.message}" }
@@ -1429,7 +2137,7 @@ fun SettingsAndBackupDialog(
                     it.write(text.toByteArray(Charsets.UTF_8))
                 }
                 withContext(Dispatchers.Main) {
-                    statusBanner = "Exported ${all.size} titles to CSV!"
+                    statusBanner = "Exported ${all.size} entries to CSV!"
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) { statusBanner = "Export error: ${e.message}" }
@@ -1440,6 +2148,7 @@ fun SettingsAndBackupDialog(
     Dialog(
         onDismissRequest = {
             enrichJob?.cancel()
+            seasonCheckJob?.cancel()
             onDismiss()
         },
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -1457,6 +2166,7 @@ fun SettingsAndBackupDialog(
                     navigationIcon = {
                         IconButton(onClick = {
                             enrichJob?.cancel()
+                            seasonCheckJob?.cancel()
                             onDismiss()
                         }) { Icon(AppIcons.Close, null) }
                     }
@@ -1479,12 +2189,172 @@ fun SettingsAndBackupDialog(
                         }
                     }
 
-                    Text("1. Free API Keys (IMDb Ratings & Posters)", fontWeight = FontWeight.Bold)
+                    // 1. Trakt.tv 1-Way Sync
+                    Text("1. Trakt.tv Sync (1-Way Pull)", fontWeight = FontWeight.Bold)
                     Text(
-                        "• OMDb Key: free (1,000/day) at omdbapi.com/apikey.aspx\n• TMDB Key: free at themoviedb.org/settings/api",
+                        "Create a personal app at trakt.tv/oauth/applications/new (Redirect URI: urn:ietf:wg:oauth:2.0:oob) to get Client ID & Secret.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    OutlinedTextField(
+                        value = traktClientId,
+                        onValueChange = { traktClientId = it },
+                        label = { Text("Trakt Client ID") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = traktClientSecret,
+                        onValueChange = { traktClientSecret = it },
+                        label = { Text("Trakt Client Secret") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    if (traktStatusText.isNotBlank()) {
+                        Text(traktStatusText, fontSize = 12.sp, color = MaterialTheme.colorScheme.secondary, fontWeight = FontWeight.Medium)
+                    }
+
+                    if (pendingDeviceCode != null) {
+                        val dc = pendingDeviceCode!!
+                        Surface(
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("Open trakt.tv/activate and enter code:", fontSize = 12.sp)
+                                Text(dc.userCode, fontSize = 24.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+                                Spacer(Modifier.height(6.dp))
+                                OutlinedButton(onClick = {
+                                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(dc.verificationUrl)))
+                                }) {
+                                    Text("Open trakt.tv/activate")
+                                }
+                            }
+                        }
+                    }
+
+                    if (traktAccessToken.isBlank()) {
+                        Button(
+                            enabled = !traktBusy,
+                            onClick = {
+                                if (traktClientId.isBlank() || traktClientSecret.isBlank()) {
+                                    traktStatusText = "Enter Trakt Client ID & Secret first."
+                                    return@Button
+                                }
+                                prefs.edit()
+                                    .putString("trakt_client_id", traktClientId.trim())
+                                    .putString("trakt_client_secret", traktClientSecret.trim())
+                                    .apply()
+                                traktBusy = true
+                                traktStatusText = "Requesting device code..."
+                                scope.launch(Dispatchers.IO) {
+                                    try {
+                                        val dc = TraktClient.requestDeviceCode(traktClientId)
+                                        withContext(Dispatchers.Main) {
+                                            pendingDeviceCode = dc
+                                            traktStatusText = "Waiting for approval on trakt.tv/activate..."
+                                        }
+                                        val deadline = System.currentTimeMillis() + dc.expiresIn * 1000L
+                                        var tokens: TraktTokens? = null
+                                        while (System.currentTimeMillis() < deadline && tokens == null) {
+                                            delay(dc.intervalSec.coerceAtLeast(5) * 1000L)
+                                            tokens = TraktClient.pollDeviceToken(traktClientId, traktClientSecret, dc.deviceCode)
+                                        }
+                                        withContext(Dispatchers.Main) {
+                                            traktBusy = false
+                                            pendingDeviceCode = null
+                                            if (tokens != null) {
+                                                traktAccessToken = tokens.accessToken
+                                                traktRefreshToken = tokens.refreshToken
+                                                traktExpiresAt = tokens.expiresAtMillis
+                                                prefs.edit()
+                                                    .putString("trakt_access_token", tokens.accessToken)
+                                                    .putString("trakt_refresh_token", tokens.refreshToken)
+                                                    .putLong("trakt_expires_at", tokens.expiresAtMillis)
+                                                    .apply()
+                                                traktStatusText = "Connected to Trakt!"
+                                            } else {
+                                                traktStatusText = "Timed out. Try connecting again."
+                                            }
+                                        }
+                                    } catch (e: Exception) {
+                                        withContext(Dispatchers.Main) {
+                                            traktBusy = false
+                                            pendingDeviceCode = null
+                                            traktStatusText = "Trakt error: ${e.message}"
+                                        }
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(if (traktBusy) "Connecting..." else "Connect Trakt")
+                        }
+                    } else {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                enabled = !traktBusy,
+                                onClick = {
+                                    traktBusy = true
+                                    scope.launch(Dispatchers.IO) {
+                                        try {
+                                            var token = traktAccessToken
+                                            if (System.currentTimeMillis() > traktExpiresAt - 300_000L && traktRefreshToken.isNotBlank()) {
+                                                withContext(Dispatchers.Main) { traktStatusText = "Refreshing Trakt token..." }
+                                                val refreshed = TraktClient.refreshAccessToken(traktClientId, traktClientSecret, traktRefreshToken)
+                                                token = refreshed.accessToken
+                                                traktAccessToken = refreshed.accessToken
+                                                traktRefreshToken = refreshed.refreshToken
+                                                traktExpiresAt = refreshed.expiresAtMillis
+                                                prefs.edit()
+                                                    .putString("trakt_access_token", refreshed.accessToken)
+                                                    .putString("trakt_refresh_token", refreshed.refreshToken)
+                                                    .putLong("trakt_expires_at", refreshed.expiresAtMillis)
+                                                    .apply()
+                                            }
+                                            val sum = TraktClient.pullOneWaySync(traktClientId, token, db) { msg ->
+                                                scope.launch(Dispatchers.Main) { traktStatusText = msg }
+                                            }
+                                            withContext(Dispatchers.Main) {
+                                                traktBusy = false
+                                                traktStatusText = "Synced! Movies: +${sum.moviesAdded}/${sum.moviesUpdated}upd • Seasons: +${sum.seasonsAdded}/${sum.seasonsUpdated}upd • Watchlist: +${sum.watchlistAdded} • Ratings: ${sum.ratingsUpdated}"
+                                                onDataChanged()
+                                            }
+                                        } catch (e: Exception) {
+                                            withContext(Dispatchers.Main) {
+                                                traktBusy = false
+                                                traktStatusText = "Sync error: ${e.message}"
+                                            }
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(if (traktBusy) "Syncing..." else "Sync from Trakt Now")
+                            }
+                            OutlinedButton(
+                                enabled = !traktBusy,
+                                onClick = {
+                                    traktAccessToken = ""
+                                    traktRefreshToken = ""
+                                    traktExpiresAt = 0L
+                                    prefs.edit()
+                                        .remove("trakt_access_token")
+                                        .remove("trakt_refresh_token")
+                                        .remove("trakt_expires_at")
+                                        .apply()
+                                    traktStatusText = "Disconnected."
+                                }
+                            ) { Text("Disconnect") }
+                        }
+                    }
+
+                    HorizontalDivider()
+
+                    // 2. OMDb & TMDB API Keys
+                    Text("2. Free API Keys (IMDb Ratings & Posters)", fontWeight = FontWeight.Bold)
                     OutlinedTextField(
                         value = omdbInput,
                         onValueChange = { omdbInput = it },
@@ -1508,7 +2378,73 @@ fun SettingsAndBackupDialog(
 
                     HorizontalDivider()
 
-                    Text("2. Import Google Sheets CSV", fontWeight = FontWeight.Bold)
+                    // 3. Auto-Check New Seasons
+                    Text("3. New Seasons Tracker (TMDB)", fontWeight = FontWeight.Bold)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Auto-check new aired seasons daily", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                "Skips Dropped & Ended series. Adds new aired seasons to Watchlist.",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = autoCheckNewSeasons,
+                            onCheckedChange = onToggleAutoCheckSeasons
+                        )
+                    }
+                    if (seasonCheckProgress.isNotBlank()) {
+                        Text(seasonCheckProgress, fontSize = 12.sp, color = MaterialTheme.colorScheme.secondary, fontWeight = FontWeight.SemiBold)
+                    }
+                    if (seasonCheckJob == null) {
+                        FilledTonalButton(
+                            onClick = {
+                                val key = tmdbInput.trim()
+                                if (key.isBlank()) {
+                                    statusBanner = "Please enter and save your TMDB API Key first."
+                                    return@FilledTonalButton
+                                }
+                                seasonCheckJob = scope.launch(Dispatchers.IO) {
+                                    val sum = runNewSeasonsCheck(db, key) { msg ->
+                                        seasonCheckProgress = msg
+                                    }
+                                    prefs.edit().putLong("last_new_season_check", System.currentTimeMillis()).apply()
+                                    withContext(Dispatchers.Main) {
+                                        seasonCheckJob = null
+                                        val addedTxt = if (sum.addedLabels.isNotEmpty()) {
+                                            "Added ${sum.addedLabels.size}: ${sum.addedLabels.take(4).joinToString(", ")}"
+                                        } else {
+                                            "No new aired seasons found"
+                                        }
+                                        seasonCheckProgress = "Checked ${sum.checkedSeries} active series • $addedTxt • Marked ${sum.markedEnded} ended."
+                                        if (sum.addedLabels.isNotEmpty()) onDataChanged()
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Check New Seasons Now")
+                        }
+                    } else {
+                        OutlinedButton(
+                            onClick = {
+                                seasonCheckJob?.cancel()
+                                seasonCheckJob = null
+                                seasonCheckProgress = "Stopped."
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Stop Checking") }
+                    }
+
+                    HorizontalDivider()
+
+                    // 4. Import Google Sheets CSV
+                    Text("4. Import Google Sheets CSV", fontWeight = FontWeight.Bold)
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
                             checked = mergeDuplicatesOnImport,
@@ -1525,12 +2461,8 @@ fun SettingsAndBackupDialog(
 
                     HorizontalDivider()
 
-                    Text("3. Fetch Missing Ratings & Posters", fontWeight = FontWeight.Bold)
-                    Text(
-                        "Updates up to 100 titles per run (respects OMDb's 1,000/day free limit).",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    // 5. Batch Fetch
+                    Text("5. Fetch Missing Ratings & Posters", fontWeight = FontWeight.Bold)
                     if (enrichProgress.isNotBlank()) {
                         Text(enrichProgress, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.secondary)
                     }
@@ -1572,7 +2504,7 @@ fun SettingsAndBackupDialog(
                                         delay(150)
                                     }
                                     withContext(Dispatchers.Main) {
-                                        enrichProgress = "Done: updated $updatedCount/${targets.size} titles!"
+                                        enrichProgress = "Done: updated $updatedCount/${targets.size} entries!"
                                         enrichJob = null
                                         onDataChanged()
                                     }
@@ -1580,7 +2512,7 @@ fun SettingsAndBackupDialog(
                             },
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("Fetch Next 100 Titles")
+                            Text("Fetch Next 100 Entries")
                         }
                     } else {
                         OutlinedButton(
@@ -1597,7 +2529,43 @@ fun SettingsAndBackupDialog(
 
                     HorizontalDivider()
 
-                    Text("4. Backup & Export", fontWeight = FontWeight.Bold)
+                    // 6. Auto-Backup & Google Drive
+                    Text("6. Auto-Backup & Google Drive", fontWeight = FontWeight.Bold)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Auto-backup to folder on change", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                if (autoBackupUri.isNotBlank()) "Folder selected (writes MovieTracker_AutoBackup.json)" else "No folder selected yet",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = autoBackupEnabled,
+                            onCheckedChange = { checked ->
+                                if (checked && autoBackupUri.isBlank()) {
+                                    folderPickerLauncher.launch(null)
+                                } else {
+                                    onUpdateAutoBackup(checked, autoBackupUri)
+                                }
+                            }
+                        )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { folderPickerLauncher.launch(null) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Pick Folder") }
+
+                        Button(
+                            onClick = { shareBackupFileToDrive(context, db) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Send to Drive") }
+                    }
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             onClick = {
