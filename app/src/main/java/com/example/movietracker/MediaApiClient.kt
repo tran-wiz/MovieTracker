@@ -1,4 +1,3 @@
-kotlin
 package com.example.movietracker
 
 import org.json.JSONObject
