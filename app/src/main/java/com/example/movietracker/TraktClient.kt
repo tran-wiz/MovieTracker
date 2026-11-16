@@ -63,7 +63,11 @@ data class TraktSyncSummary(
     val seasonsUpdated: Int,
     val watchlistAdded: Int,
     val ratingsUpdated: Int
-)
+) {
+    fun hasChanges(): Boolean {
+        return moviesAdded + moviesUpdated + seasonsAdded + seasonsUpdated + watchlistAdded + ratingsUpdated > 0
+    }
+}
 
 object TraktClient {
     private const val BASE = "https://api.trakt.tv"
@@ -177,7 +181,7 @@ object TraktClient {
         clientId: String,
         accessToken: String,
         db: MovieDatabaseHelper,
-        onStatus: (String) -> Unit
+        onStatus: (String) -> Unit = {}
     ): TraktSyncSummary {
         onStatus("Fetching watched movies...")
         val watchedMovies = fetchWatchedMovies(clientId, accessToken)
