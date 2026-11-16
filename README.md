@@ -1,5 +1,10 @@
 # 🎬 MovieTracker
 
+[![Build APK](https://github.com/tran-wiz/MovieTracker/actions/workflows/build-apk.yml/badge.svg)](https://github.com/tran-wiz/MovieTracker/actions/workflows/build-apk.yml)
+![Kotlin](https://img.shields.io/badge/Kotlin-2.1-7F52FF?logo=kotlin&logoColor=white)
+![Android](https://img.shields.io/badge/Android-7.0%2B%20(API%2024)-3DDC84?logo=android&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-blue.svg)
+
 > **Personal offline-first Android app for tracking watched movies, TV series by season, and watchlist — with Trakt.tv 1-way sync, TMDB/OMDb enrichment, and a clean Trakt-inspired dark UI.**
 
 [🇬🇧 English](#english) • [🇻🇳 Tiếng Việt](#tiếng-việt)
@@ -91,3 +96,10 @@ The built-in CSV importer supports spreadsheets with columns:
 1. Lưu thay đổi lên nhánh `main` (hoặc chạy thủ công trong tab **Actions**).
 2. Mở lượt chạy **Build Android APK** có tích xanh mới nhất.
 3. Tải **`MovieTracker-APK`** ở mục **Artifacts**, giải nén và cài file `app-debug.apk` lên điện thoại Android (Android 7.0 trở lên).
+
+---
+
+## 🙏 Credits & Attribution
+- Movie & TV metadata, posters, and season schedules powered by [TMDB](https://www.themoviedb.org/) and [OMDb API](https://www.omdbapi.com/).
+- Watch history, progress, and watchlist sync powered by [Trakt.tv](https://trakt.tv/).
+- *This product uses the TMDB API but is not endorsed or certified by TMDB.*
