@@ -10,6 +10,7 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStream
 import java.io.InputStreamReader
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -26,13 +27,13 @@ enum class MovieStatus(val code: String, val label: String) {
     }
 }
 
-enum class SortOption(val label: String) {
-    UPDATED_DESC("Recent"),
-    WATCHED_DATE_DESC("Watched Date"),
-    IMDB_RATING_DESC("IMDb Rating"),
-    PERSONAL_RATING_DESC("My Score"),
-    YEAR_DESC("Release Year"),
-    TITLE_ASC("Title A–Z")
+enum class SortOption(val label: String, val defaultAscending: Boolean) {
+    UPDATED_DESC("Updated", false),
+    WATCHED_DATE_DESC("Watched Date", false),
+    IMDB_RATING_DESC("IMDb Rating", false),
+    PERSONAL_RATING_DESC("My Score", false),
+    YEAR_DESC("Year", false),
+    TITLE_ASC("Title", true)
 }
 
 data class MovieItem(
@@ -71,6 +72,14 @@ data class MovieItem(
         return ""
     }
 
+    fun effectiveTraktUrl(): String {
+        return if (imdbId.isNotBlank()) {
+            "https://trakt.tv/search/imdb/$imdbId"
+        } else {
+            "https://trakt.tv/search?query=${URLEncoder.encode(title, "UTF-8")}"
+        }
+    }
+
     fun seriesGroupKey(): String {
         return if (imdbId.isNotBlank()) {
             "imdb:${imdbId.trim().lowercase(Locale.ROOT)}"
@@ -87,6 +96,10 @@ sealed interface LibraryEntry {
     val sortPersonalRating: Double?
     val sortYear: Int
     val sortTitle: String
+    val entryPosterUrl: String
+    val entryTitle: String
+    val entryStatus: MovieStatus
+    val isCurrentlyWatching: Boolean
 }
 
 data class SingleLibraryEntry(val item: MovieItem) : LibraryEntry {
@@ -96,6 +109,10 @@ data class SingleLibraryEntry(val item: MovieItem) : LibraryEntry {
     override val sortPersonalRating: Double? get() = item.personalRating
     override val sortYear: Int get() = item.releaseYear
     override val sortTitle: String get() = item.title
+    override val entryPosterUrl: String get() = item.posterUrl
+    override val entryTitle: String get() = item.title
+    override val entryStatus: MovieStatus get() = item.status
+    override val isCurrentlyWatching: Boolean get() = false
 }
 
 data class SeriesGroupEntry(
@@ -114,6 +131,7 @@ data class SeriesGroupEntry(
     val watchlistCount: Int,
     val droppedCount: Int,
     val activeWatchingNote: String,
+    val nextWatchlistSeason: Int?,
     val seriesEnded: Boolean,
     override val sortUpdatedAt: Long,
     override val sortWatchedDate: String
@@ -122,6 +140,26 @@ data class SeriesGroupEntry(
     override val sortPersonalRating: Double? get() = avgPersonalRating
     override val sortYear: Int get() = releaseYear
     override val sortTitle: String get() = title
+    override val entryPosterUrl: String get() = posterUrl
+    override val entryTitle: String get() = title
+    override val isCurrentlyWatching: Boolean
+        get() = activeWatchingNote.isNotBlank() || (watchedCount > 0 && watchlistCount > 0)
+    override val entryStatus: MovieStatus
+        get() = when {
+            watchedCount == seasons.size && seasons.isNotEmpty() -> MovieStatus.WATCHED
+            droppedCount == seasons.size && seasons.isNotEmpty() -> MovieStatus.DROPPED
+            watchlistCount > 0 -> MovieStatus.WATCHLIST
+            watchedCount > 0 -> MovieStatus.WATCHED
+            else -> MovieStatus.DROPPED
+        }
+
+    fun effectiveTraktUrl(): String {
+        return if (imdbId.isNotBlank()) {
+            "https://trakt.tv/search/imdb/$imdbId"
+        } else {
+            "https://trakt.tv/search?query=${URLEncoder.encode(title, "UTF-8")}"
+        }
+    }
 }
 
 data class SeriesCheckCandidate(
@@ -143,7 +181,8 @@ fun buildLibraryEntries(
     search: String,
     statusFilter: MovieStatus?,
     typeFilter: String?,
-    sortOption: SortOption
+    sortOption: SortOption,
+    sortAscending: Boolean = sortOption.defaultAscending
 ): List<LibraryEntry> {
     val entries = mutableListOf<LibraryEntry>()
     val seriesBuckets = linkedMapOf<String, MutableList<MovieItem>>()
@@ -169,8 +208,10 @@ fun buildLibraryEntries(
             it.episodeProgress.startsWith("Watching:", ignoreCase = true) && it.status != MovieStatus.WATCHED
         }?.let {
             val sLabel = it.seasonNumber?.let { n -> "S${n.toString().padStart(2, '0')} " } ?: ""
-            "$sLabel${it.episodeProgress}"
+            "$sLabel${it.episodeProgress.removePrefix("Watching:").trim()}"
         } ?: ""
+
+        val nextWlSeason = seasons.firstOrNull { it.status == MovieStatus.WATCHLIST }?.seasonNumber
 
         val personalScores = seasons.mapNotNull { it.personalRating }
         val avgPersonal = if (personalScores.isNotEmpty()) personalScores.average() else null
@@ -193,6 +234,7 @@ fun buildLibraryEntries(
                 watchlistCount = watchlistCount,
                 droppedCount = droppedCount,
                 activeWatchingNote = activeProgress,
+                nextWatchlistSeason = nextWlSeason,
                 seriesEnded = seasons.any { it.seriesEnded },
                 sortUpdatedAt = seasons.maxOf { it.updatedAt },
                 sortWatchedDate = seasons.mapNotNull { it.watchedDate.ifBlank { null } }.maxOrNull() ?: ""
@@ -242,27 +284,50 @@ fun buildLibraryEntries(
     }
 
     return when (sortOption) {
-        SortOption.UPDATED_DESC -> filtered.sortedByDescending { it.sortUpdatedAt }
-        SortOption.WATCHED_DATE_DESC -> filtered.sortedWith(
-            compareBy<LibraryEntry> { it.sortWatchedDate.isBlank() }
-                .thenByDescending { it.sortWatchedDate }
-                .thenByDescending { it.sortUpdatedAt }
-        )
-        SortOption.IMDB_RATING_DESC -> filtered.sortedWith(
-            compareBy<LibraryEntry> { it.sortImdbRating == null }
-                .thenByDescending { it.sortImdbRating ?: 0.0 }
-                .thenBy { it.sortTitle.lowercase(Locale.ROOT) }
-        )
-        SortOption.PERSONAL_RATING_DESC -> filtered.sortedWith(
-            compareBy<LibraryEntry> { it.sortPersonalRating == null }
-                .thenByDescending { it.sortPersonalRating ?: 0.0 }
-                .thenBy { it.sortTitle.lowercase(Locale.ROOT) }
-        )
-        SortOption.YEAR_DESC -> filtered.sortedWith(
-            compareByDescending<LibraryEntry> { it.sortYear }
-                .thenBy { it.sortTitle.lowercase(Locale.ROOT) }
-        )
-        SortOption.TITLE_ASC -> filtered.sortedBy { it.sortTitle.lowercase(Locale.ROOT) }
+        SortOption.UPDATED_DESC -> {
+            if (sortAscending) filtered.sortedBy { it.sortUpdatedAt }
+            else filtered.sortedByDescending { it.sortUpdatedAt }
+        }
+        SortOption.WATCHED_DATE_DESC -> {
+            val comp = compareBy<LibraryEntry> { it.sortWatchedDate.isBlank() }
+            val ordered = if (sortAscending) {
+                comp.thenBy { it.sortWatchedDate }
+            } else {
+                comp.thenByDescending { it.sortWatchedDate }
+            }
+            filtered.sortedWith(ordered.thenByDescending { it.sortUpdatedAt })
+        }
+        SortOption.IMDB_RATING_DESC -> {
+            val comp = compareBy<LibraryEntry> { it.sortImdbRating == null }
+            val ordered = if (sortAscending) {
+                comp.thenBy { it.sortImdbRating ?: 0.0 }
+            } else {
+                comp.thenByDescending { it.sortImdbRating ?: 0.0 }
+            }
+            filtered.sortedWith(ordered.thenBy { it.sortTitle.lowercase(Locale.ROOT) })
+        }
+        SortOption.PERSONAL_RATING_DESC -> {
+            val comp = compareBy<LibraryEntry> { it.sortPersonalRating == null }
+            val ordered = if (sortAscending) {
+                comp.thenBy { it.sortPersonalRating ?: 0.0 }
+            } else {
+                comp.thenByDescending { it.sortPersonalRating ?: 0.0 }
+            }
+            filtered.sortedWith(ordered.thenBy { it.sortTitle.lowercase(Locale.ROOT) })
+        }
+        SortOption.YEAR_DESC -> {
+            val comp = compareBy<LibraryEntry> { it.sortYear <= 0 }
+            val ordered = if (sortAscending) {
+                comp.thenBy { it.sortYear }
+            } else {
+                comp.thenByDescending { it.sortYear }
+            }
+            filtered.sortedWith(ordered.thenBy { it.sortTitle.lowercase(Locale.ROOT) })
+        }
+        SortOption.TITLE_ASC -> {
+            if (sortAscending) filtered.sortedBy { it.sortTitle.lowercase(Locale.ROOT) }
+            else filtered.sortedByDescending { it.sortTitle.lowercase(Locale.ROOT) }
+        }
     }
 }
 
@@ -463,7 +528,6 @@ class MovieDatabaseHelper(context: Context) :
         return list
     }
 
-    /** Lấy các Series đủ điều kiện kiểm tra mùa mới (chưa Ended, và mùa mới nhất chưa bị Dropped) */
     fun getSeriesCandidatesForNewSeasons(): List<SeriesCheckCandidate> {
         val groups = buildLibraryEntries(getAllMovies(), "", null, "Series", SortOption.UPDATED_DESC)
             .filterIsInstance<SeriesGroupEntry>()
@@ -471,7 +535,6 @@ class MovieDatabaseHelper(context: Context) :
         for (g in groups) {
             if (g.seriesEnded) continue
             val latestSeason = g.seasons.maxByOrNull { it.seasonNumber ?: 0 } ?: continue
-            // Bỏ qua nếu toàn bộ hoặc mùa mới nhất đã bị Dropped
             if (latestSeason.status == MovieStatus.DROPPED || g.droppedCount == g.seasons.size) continue
             val maxSeason = g.seasons.mapNotNull { it.seasonNumber }.maxOrNull() ?: 1
             candidates.add(
@@ -514,7 +577,7 @@ class MovieDatabaseHelper(context: Context) :
         val db = writableDatabase
         db.beginTransaction()
         try {
-            val existingKeys = getAllMovies().mapNotNull { m ->
+            val existingKeys = getAllMovies().map { m ->
                 val s = m.seasonNumber ?: 0
                 if (m.imdbId.isNotBlank()) "${m.imdbId.lowercase(Locale.ROOT)}#$s"
                 else "${m.title.trim().lowercase(Locale.ROOT)}#$s"
@@ -633,7 +696,6 @@ class MovieDatabaseHelper(context: Context) :
                 return byTitleAndSeason["${title.trim().lowercase(Locale.ROOT)}#$season"]
             }
 
-            // 1. Watched Movies
             for (wm in watchedMovies) {
                 val existing = findMatch(wm.imdbId, wm.title, 0)
                 val dateIso = wm.lastWatchedAt.take(10)
@@ -677,7 +739,6 @@ class MovieDatabaseHelper(context: Context) :
                 }
             }
 
-            // 2. Watched / In-progress Seasons
             for (ws in watchedSeasons) {
                 val existing = findMatch(ws.imdbId, ws.showTitle, ws.seasonNumber)
                 val dateIso = ws.lastWatchedAt.take(10)
@@ -735,7 +796,6 @@ class MovieDatabaseHelper(context: Context) :
                 }
             }
 
-            // 3. Watchlist
             for (wl in watchlistItems) {
                 val seasonNum = if (wl.type == "Series") (wl.seasonNumber ?: 1) else 0
                 val existing = if (wl.type == "Series") {
@@ -772,7 +832,6 @@ class MovieDatabaseHelper(context: Context) :
                 }
             }
 
-            // 4. Ratings
             for (rt in ratings) {
                 if (rt.type == "Movie") {
                     val existing = findMatch(rt.imdbId, rt.title, 0)
@@ -991,7 +1050,7 @@ object CsvAndBackupHelper {
         }
         return JSONObject().apply {
             put("app", "MovieTracker")
-            put("version", 2)
+            put("version", 3)
             put("exportedAt", System.currentTimeMillis())
             put("movies", arr)
         }.toString(2)
