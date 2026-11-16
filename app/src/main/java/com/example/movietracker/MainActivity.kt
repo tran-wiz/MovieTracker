@@ -7,7 +7,10 @@ import android.content.Intent
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -28,7 +31,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
@@ -44,7 +49,7 @@ enum class AppTab(val label: String) {
     HOME("Home"),
     WATCHLIST("Watchlist"),
     LIBRARY("Library"),
-    SEARCH("Search"),
+    SEARCH("Discover"),
     SETTINGS("Settings")
 }
 
@@ -53,6 +58,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        configureAppCheck(this, intent)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
         extractIncomingShare(intent)
         setContent {
             MovieTrackerTheme {
@@ -66,6 +76,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
+        configureAppCheck(this, intent)
         extractIncomingShare(intent)
     }
 
@@ -137,6 +149,9 @@ fun MovieTrackerApp(
 
     var hasRunStartupChecks by remember { mutableStateOf(false) }
     var homeSyncing by remember { mutableStateOf(false) }
+    var discoverSubTab by remember { mutableIntStateOf(0) }
+    var addingAiTitles by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val cinemaAiViewModel: CinemaAiViewModel = viewModel()
 
     fun triggerDataUpdated(runAutoBackup: Boolean = true) {
         refreshTrigger++
@@ -231,7 +246,7 @@ fun MovieTrackerApp(
                     AppTab.HOME to AppIcons.Home,
                     AppTab.WATCHLIST to AppIcons.Bookmark,
                     AppTab.LIBRARY to AppIcons.Library,
-                    AppTab.SEARCH to AppIcons.Search,
+                    AppTab.SEARCH to AppIcons.Sparkles,
                     AppTab.SETTINGS to AppIcons.Settings
                 )
                 navItems.forEach { (tab, icon) ->
@@ -289,7 +304,11 @@ fun MovieTrackerApp(
                     },
                     onOpenEntry = ::openEntry,
                     onGoToSettings = { currentTab = AppTab.SETTINGS },
-                    onGoToWatchlist = { currentTab = AppTab.WATCHLIST }
+                    onGoToWatchlist = { currentTab = AppTab.WATCHLIST },
+                    onOpenAiDiscover = {
+                        discoverSubTab = 0
+                        currentTab = AppTab.SEARCH
+                    }
                 )
 
                 AppTab.WATCHLIST -> CollectionTabScreen(
@@ -340,8 +359,65 @@ fun MovieTrackerApp(
                     }
                 )
 
-                AppTab.SEARCH -> SearchTabScreen(
+                AppTab.SEARCH -> DiscoverAndSearchTabScreen(
+                    subTabIndex = discoverSubTab,
+                    onSubTabChange = { discoverSubTab = it },
+                    cinemaAiViewModel = cinemaAiViewModel,
                     allMovies = allMovies,
+                    omdbKey = omdbKey,
+                    tmdbKey = tmdbKey,
+                    addingAiTitles = addingAiTitles,
+                    onAddAiSuggestionToWatchlist = { suggestion ->
+                        val key = "${suggestion.title.lowercase(Locale.ROOT)}#${suggestion.releaseYear}"
+                        if (key in addingAiTitles) return@DiscoverAndSearchTabScreen
+                        addingAiTitles = addingAiTitles + key
+                        scope.launch(Dispatchers.IO) {
+                            val enriched = if ((omdbKey.isNotBlank() || tmdbKey.isNotBlank()) &&
+                                (suggestion.posterUrl.isBlank() || suggestion.imdbId.isBlank())
+                            ) {
+                                runCatching {
+                                    MediaApiClient.enrichFromApis(
+                                        title = suggestion.title,
+                                        year = suggestion.releaseYear,
+                                        imdbId = suggestion.imdbId,
+                                        isSeries = suggestion.type == "Series",
+                                        tmdbId = suggestion.tmdbId,
+                                        omdbKey = omdbKey,
+                                        tmdbKey = tmdbKey
+                                    )
+                                }.getOrNull()
+                            } else null
+
+                            val finalImdbId = enriched?.imdbId?.ifBlank { null } ?: suggestion.imdbId
+                            val newItem = MovieItem(
+                                title = enriched?.title?.ifBlank { null } ?: suggestion.title,
+                                type = enriched?.type ?: suggestion.type,
+                                releaseYear = enriched?.releaseYear?.takeIf { it > 0 } ?: suggestion.releaseYear,
+                                imdbId = finalImdbId,
+                                imdbUrl = if (finalImdbId.isNotBlank()) "https://www.imdb.com/title/$finalImdbId/" else "",
+                                seasonNumber = if ((enriched?.type ?: suggestion.type) == "Series") 1 else null,
+                                status = MovieStatus.WATCHLIST,
+                                imdbRating = enriched?.imdbRating ?: suggestion.imdbRating,
+                                genres = enriched?.genres?.ifBlank { null } ?: suggestion.genres,
+                                plot = enriched?.plot?.ifBlank { null } ?: suggestion.plot,
+                                posterUrl = enriched?.posterUrl?.ifBlank { null } ?: suggestion.posterUrl,
+                                notes = if (suggestion.reason.isNotBlank()) "AI Discover: ${suggestion.reason}" else ""
+                            )
+                            db.insertMovie(newItem)
+                            withContext(Dispatchers.Main) {
+                                addingAiTitles = addingAiTitles - key
+                                triggerDataUpdated()
+                                Toast.makeText(context, "Added \"${newItem.title}\" to Watchlist", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    onOpenExistingMovie = { existing ->
+                        if (existing.type.equals("Series", true)) {
+                            selectedSeriesKey = existing.seriesGroupKey()
+                        } else {
+                            selectedMovie = existing
+                        }
+                    },
                     searchQuery = searchQuery,
                     onSearchQueryChange = { searchQuery = it },
                     typeFilter = typeFilter,
@@ -571,7 +647,8 @@ fun HomeTabScreen(
     onQuickAdd: () -> Unit,
     onOpenEntry: (LibraryEntry) -> Unit,
     onGoToSettings: () -> Unit,
-    onGoToWatchlist: () -> Unit
+    onGoToWatchlist: () -> Unit,
+    onOpenAiDiscover: () -> Unit
 ) {
     val continueWatching = remember(allMovies) {
         buildLibraryEntries(allMovies, "", null, "Series", SortOption.UPDATED_DESC, false)
@@ -617,6 +694,59 @@ fun HomeTabScreen(
                     }
                     IconButton(onClick = onQuickAdd) {
                         Icon(AppIcons.Add, "Add Title", tint = Color.White)
+                    }
+                }
+            }
+        }
+
+        item {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(
+                        Brush.linearGradient(
+                            colors = listOf(
+                                TraktPurple.copy(alpha = 0.28f),
+                                WatchlistBlue.copy(alpha = 0.16f),
+                                TraktSurface
+                            )
+                        )
+                    )
+                    .border(1.dp, TraktPurple.copy(alpha = 0.35f), RoundedCornerShape(16.dp))
+                    .clickable(onClick = onOpenAiDiscover)
+                    .padding(16.dp)
+                    .testTag("home_ai_discover_card")
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(AppIcons.Sparkles, null, tint = ImdbGold, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("For My Taste", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Personalized picks from your ratings, library & current trends.",
+                            fontSize = 12.sp,
+                            color = Color(0xFFD1D5DB)
+                        )
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    FilledTonalButton(
+                        onClick = onOpenAiDiscover,
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = TraktPurple.copy(alpha = 0.3f),
+                            contentColor = Color.White
+                        ),
+                        modifier = Modifier.heightIn(min = 48.dp)
+                    ) {
+                        Text("See Picks", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
@@ -954,6 +1084,88 @@ fun CollectionTabScreen(
                         is SeriesGroupEntry -> SeriesGroupCard(group = entry, onClick = { onOpenEntry(entry) })
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun DiscoverAndSearchTabScreen(
+    subTabIndex: Int,
+    onSubTabChange: (Int) -> Unit,
+    cinemaAiViewModel: CinemaAiViewModel,
+    allMovies: List<MovieItem>,
+    omdbKey: String,
+    tmdbKey: String,
+    addingAiTitles: Set<String>,
+    onAddAiSuggestionToWatchlist: (AiMovieSuggestion) -> Unit,
+    onOpenExistingMovie: (MovieItem) -> Unit,
+    searchQuery: String,
+    onSearchQueryChange: (String) -> Unit,
+    typeFilter: String?,
+    onTypeFilterChange: (String?) -> Unit,
+    sortOption: SortOption,
+    sortAscending: Boolean,
+    onOpenEntry: (LibraryEntry) -> Unit,
+    onSearchOnline: (String) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilterChip(
+                selected = subTabIndex == 0,
+                onClick = { onSubTabChange(0) },
+                leadingIcon = {
+                    Icon(AppIcons.Sparkles, null, modifier = Modifier.size(16.dp))
+                },
+                label = { Text("For My Taste", fontWeight = FontWeight.SemiBold) },
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 48.dp)
+                    .testTag("discover_subtab_ai")
+            )
+            FilterChip(
+                selected = subTabIndex == 1,
+                onClick = { onSubTabChange(1) },
+                leadingIcon = {
+                    Icon(AppIcons.Search, null, modifier = Modifier.size(16.dp))
+                },
+                label = { Text("Library & Web", fontWeight = FontWeight.SemiBold) },
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 48.dp)
+                    .testTag("discover_subtab_search")
+            )
+        }
+
+        Box(modifier = Modifier.weight(1f)) {
+            if (subTabIndex == 0) {
+                CinemaAiDiscoverScreen(
+                    viewModel = cinemaAiViewModel,
+                    allMovies = allMovies,
+                    omdbKey = omdbKey,
+                    tmdbKey = tmdbKey,
+                    addingTitles = addingAiTitles,
+                    onAddToWatchlist = onAddAiSuggestionToWatchlist,
+                    onOpenAddDialogWithTitle = onSearchOnline,
+                    onOpenExistingEntry = onOpenExistingMovie
+                )
+            } else {
+                SearchTabScreen(
+                    allMovies = allMovies,
+                    searchQuery = searchQuery,
+                    onSearchQueryChange = onSearchQueryChange,
+                    typeFilter = typeFilter,
+                    onTypeFilterChange = onTypeFilterChange,
+                    sortOption = sortOption,
+                    sortAscending = sortAscending,
+                    onOpenEntry = onOpenEntry,
+                    onSearchOnline = onSearchOnline
+                )
             }
         }
     }
