@@ -12,7 +12,7 @@
 
 | Home & Continue Watching | 3-Column Poster Grid (Search) | Series Season Tracker | Details (IMDb & Trakt) |
 | :---: | :---: | :---: | :---: |
-| ![Home](docs/screenshots/homejpg) | ![Search](docs/screenshots/searchjpg) | ![Series](docs/screenshots/seriesjpg) | ![Details](docs/screenshots/detailsjpg) |
+| ![Home](docs/screenshots/home.jpg) | ![Search](docs/screenshots/search.jpg) | ![Series](docs/screenshots/series.jpg) | ![Details](docs/screenshots/details.jpg) |
 
 ---
 
