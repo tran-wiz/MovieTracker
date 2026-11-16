@@ -24,13 +24,13 @@ data class ApiMediaResult(
 data class TmdbSeasonInfo(
     val seasonNumber: Int,
     val episodeCount: Int,
-    val airDate: String // YYYY-MM-DD hoặc ""
+    val airDate: String
 ) {
     val airYear: Int get() = airDate.take(4).toIntOrNull() ?: 0
 }
 
 data class TmdbSeriesDetails(
-    val status: String, // "Returning Series", "Ended", "Canceled", ...
+    val status: String,
     val seasons: List<TmdbSeasonInfo>,
     val posterUrl: String = "",
     val plot: String = ""
